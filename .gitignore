@@ -1,0 +1,69 @@
+# Секреты и ключи окружения
+.env
+.env.*
+*.key
+*.pem
+
+# Виртуальные окружения
+.venv/
+venv/
+env/
+ENV/
+.uv/
+
+# Кэш Python и компиляции
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# Кэш и логи ML-библиотек
+# CatBoost автоматически создает эту папку при обучении:
+catboost_info/
+# AutoGluon сохраняет модели сюда по умолчанию:
+AutogluonModels/
+autogluon_output/
+# Логи и эксперименты:
+mlruns/
+wandb/
+lightning_logs/
+*.log
+
+# Локальные сабмиты и архивы
+*.zip
+*.tar.gz
+submission.csv
+sub.csv
+
+# Файлы операционных систем
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Настройки IDE
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
