@@ -1,0 +1,65 @@
+feature,role,dtype,unit,description_ru
+Year_Factor,feature,numeric,код года,Код года наблюдения; календарный год анонимизирован
+State_Factor,feature,category,категория,Код штата; действительное название анонимизировано
+building_class,feature,category,категория,Класс здания: Residential или Commercial
+facility_type,feature,category,категория,Назначение здания
+floor_area,feature,numeric,ft²,Площадь здания
+year_built,feature,numeric,год,Год постройки; исходные нули и пропуски сохранены
+energy_star_rating,feature,numeric,баллы,Рейтинг энергоэффективности ENERGY STAR
+ELEVATION,feature,numeric,"исходная, не уточнена",Высота местоположения здания; единица в словаре соревнования не указана
+january_min_temp_c,feature,numeric,°C,Минимальная температура в январе
+january_avg_temp_c,feature,numeric,°C,Средняя температура в январе
+january_max_temp_c,feature,numeric,°C,Максимальная температура в январе
+february_min_temp_c,feature,numeric,°C,Минимальная температура в феврале
+february_avg_temp_c,feature,numeric,°C,Средняя температура в феврале
+february_max_temp_c,feature,numeric,°C,Максимальная температура в феврале
+march_min_temp_c,feature,numeric,°C,Минимальная температура в марте
+march_avg_temp_c,feature,numeric,°C,Средняя температура в марте
+march_max_temp_c,feature,numeric,°C,Максимальная температура в марте
+april_min_temp_c,feature,numeric,°C,Минимальная температура в апреле
+april_avg_temp_c,feature,numeric,°C,Средняя температура в апреле
+april_max_temp_c,feature,numeric,°C,Максимальная температура в апреле
+may_min_temp_c,feature,numeric,°C,Минимальная температура в мае
+may_avg_temp_c,feature,numeric,°C,Средняя температура в мае
+may_max_temp_c,feature,numeric,°C,Максимальная температура в мае
+june_min_temp_c,feature,numeric,°C,Минимальная температура в июне
+june_avg_temp_c,feature,numeric,°C,Средняя температура в июне
+june_max_temp_c,feature,numeric,°C,Максимальная температура в июне
+july_min_temp_c,feature,numeric,°C,Минимальная температура в июле
+july_avg_temp_c,feature,numeric,°C,Средняя температура в июле
+july_max_temp_c,feature,numeric,°C,Максимальная температура в июле
+august_min_temp_c,feature,numeric,°C,Минимальная температура в августе
+august_avg_temp_c,feature,numeric,°C,Средняя температура в августе
+august_max_temp_c,feature,numeric,°C,Максимальная температура в августе
+september_min_temp_c,feature,numeric,°C,Минимальная температура в сентябре
+september_avg_temp_c,feature,numeric,°C,Средняя температура в сентябре
+september_max_temp_c,feature,numeric,°C,Максимальная температура в сентябре
+october_min_temp_c,feature,numeric,°C,Минимальная температура в октябре
+october_avg_temp_c,feature,numeric,°C,Средняя температура в октябре
+october_max_temp_c,feature,numeric,°C,Максимальная температура в октябре
+november_min_temp_c,feature,numeric,°C,Минимальная температура в ноябре
+november_avg_temp_c,feature,numeric,°C,Средняя температура в ноябре
+november_max_temp_c,feature,numeric,°C,Максимальная температура в ноябре
+december_min_temp_c,feature,numeric,°C,Минимальная температура в декабре
+december_avg_temp_c,feature,numeric,°C,Средняя температура в декабре
+december_max_temp_c,feature,numeric,°C,Максимальная температура в декабре
+cooling_degree_days_c,feature,numeric,°C·сутки,Годовая сумма превышений средней суточной температуры над 18⅓ °C
+heating_degree_days_c,feature,numeric,°C·сутки,Годовая сумма недостатка средней суточной температуры относительно 18⅓ °C
+precipitation_inches,feature,numeric,дюймы,Годовое количество осадков
+snowfall_inches,feature,numeric,дюймы,Годовое количество выпавшего снега
+snowdepth_inches,feature,numeric,дюймы,Годовой показатель глубины снежного покрова; способ агрегации не уточнён
+avg_temp_c,feature,numeric,°C,Средняя температура за год
+days_below_minus1C,feature,numeric,дни,Количество дней с температурой ниже порога ≈ -1 °C
+days_below_minus7C,feature,numeric,дни,Количество дней с температурой ниже порога ≈ -7 °C
+days_below_minus12C,feature,numeric,дни,Количество дней с температурой ниже порога ≈ -12 °C
+days_below_minus18C,feature,numeric,дни,Количество дней с температурой ниже порога ≈ -18 °C
+days_above_27C,feature,numeric,дни,Количество дней с температурой выше порога ≈ 27 °C
+days_above_32C,feature,numeric,дни,Количество дней с температурой выше порога ≈ 32 °C
+days_above_38C,feature,numeric,дни,Количество дней с температурой выше порога ≈ 38 °C
+days_above_43C,feature,numeric,дни,Количество дней с температурой выше порога ≈ 43 °C
+direction_max_wind_speed,feature,numeric,угловые градусы,"Направление ветра при максимальной скорости; 360 — север, 180 — юг"
+direction_peak_wind_speed,feature,numeric,угловые градусы,Направление ветра при пиковом порыве
+max_wind_speed,feature,numeric,"исходная, не уточнена",Максимальная скорость ветра; единица в словаре соревнования не указана
+days_with_fog,feature,numeric,дни,Количество дней с туманом
+site_eui,target,numeric,kBtu/ft²/год,Удельное годовое потребление энергии зданием; целевая переменная
+id,id,numeric,идентификатор,Идентификатор строки; не подтверждён как постоянный идентификатор здания между годами

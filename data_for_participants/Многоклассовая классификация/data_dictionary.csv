@@ -1,0 +1,45 @@
+feature,role,dtype,unit,description_ru
+id,id,numeric,идентификатор,Идентификатор строки
+dur,feature,numeric,с,Длительность flow
+proto,feature,category,протокол,"Протокол передачи (tcp, udp, …)"
+service,feature,category,сервис,"Сетевой сервис (http, ftp, …); «-» если не определён"
+state,feature,category,состояние,"Состояние соединения (FIN, CON, INT, …)"
+spkts,feature,numeric,пакеты,Число пакетов source → destination
+dpkts,feature,numeric,пакеты,Число пакетов destination → source
+sbytes,feature,numeric,байты,Объём данных source → destination
+dbytes,feature,numeric,байты,Объём данных destination → source
+rate,feature,numeric,trans/s,Число транзакций в секунду
+sttl,feature,numeric,TTL,Time to live (source → destination)
+dttl,feature,numeric,TTL,Time to live (destination → source)
+sload,feature,numeric,bit/s,Нагрузка source
+dload,feature,numeric,bit/s,Нагрузка destination
+sloss,feature,numeric,пакеты,Потери/повторы пакетов source
+dloss,feature,numeric,пакеты,Потери/повторы пакетов destination
+sinpkt,feature,numeric,мс,Межпакетный интервал source
+dinpkt,feature,numeric,мс,Межпакетный интервал destination
+sjit,feature,numeric,мс,Jitter source
+djit,feature,numeric,мс,Jitter destination
+swin,feature,numeric,байты,TCP window source
+stcpb,feature,numeric,номер,TCP base sequence number source
+dtcpb,feature,numeric,номер,TCP base sequence number destination
+dwin,feature,numeric,байты,TCP window destination
+tcprtt,feature,numeric,мс,Round-trip time TCP-соединения
+synack,feature,numeric,мс,Время SYN → SYN-ACK
+ackdat,feature,numeric,мс,Время SYN-ACK → ACK
+smean,feature,numeric,байты,Средний размер пакета source
+dmean,feature,numeric,байты,Средний размер пакета destination
+trans_depth,feature,numeric,уровень,Глубина HTTP pipelining
+response_body_len,feature,numeric,байты,Размер HTTP response body
+ct_srv_src,feature,numeric,счётчик,Число conn. с тем же service и source IP
+ct_state_ttl,feature,numeric,счётчик,Счётчик по state и TTL
+ct_dst_ltm,feature,numeric,счётчик,Число conn. с тем же destination IP
+ct_src_dport_ltm,feature,numeric,счётчик,Число conn. с тем же source IP и dest port
+ct_dst_sport_ltm,feature,numeric,счётчик,Число conn. с тем же dest IP и source port
+ct_dst_src_ltm,feature,numeric,счётчик,Число conn. с той же парой source/dest IP
+is_ftp_login,feature,binary,0/1,FTP-сессия с логином и паролем
+ct_ftp_cmd,feature,numeric,счётчик,Число FTP-команд в сессии
+ct_flw_http_mthd,feature,numeric,счётчик,Число HTTP GET/POST в flow
+ct_src_ltm,feature,numeric,счётчик,Число conn. с тем же source IP
+ct_srv_dst,feature,numeric,счётчик,Число conn. с тем же service и dest IP
+is_sm_ips_ports,feature,binary,0/1,Source и dest IP/порты совпадают
+attack_cat,target,category,метка,Тип атаки (10 классов); целевая переменная
