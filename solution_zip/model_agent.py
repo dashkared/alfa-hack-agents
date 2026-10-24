@@ -146,17 +146,19 @@ class ModelPortfolioAgent:
             if not improved:
                 break
 
-        # Точечная локальная подгонка (+/- 15%) вокруг оптимумов
+        # Плотное непрерывное сканирование (17 точек) вокруг найденного оптимума для каждого класса
         for c in class_order:
-            for fine_factor in [0.85, 1.15]:
+            w_c = best_weights[c]
+            dense_grid = np.linspace(w_c * 0.65, w_c * 1.45, 17)
+            for test_w in dense_grid:
                 test_weights = best_weights.copy()
-                test_weights[c] = best_weights[c] * fine_factor
+                test_weights[c] = float(test_w)
                 scaled_probs = oof_probs * test_weights
                 preds = np.argmax(scaled_probs, axis=1)
                 score = float(f1_score(y_true, preds, average="macro"))
                 if score > best_score:
                     best_score = score
-                    best_weights[c] = test_weights[c]
+                    best_weights[c] = float(test_w)
 
         if verbose:
             print(
@@ -197,11 +199,37 @@ class ModelPortfolioAgent:
             oof_preds = np.zeros(len(y_vals), dtype=np.float32)
             test_preds = np.zeros(len(X_test_enc), dtype=np.float32)
 
+            # Кандидаты категориальных колонок для Out-of-Fold Target Encoding (без утечек)
+            te_candidates = [
+                c for c in cat_features
+                if c in X_train.columns and 2 <= X_train[c].nunique() <= 120
+            ][:4]
+
             kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=42)
 
             for fold, (train_idx, val_idx) in enumerate(kf.split(X_train_enc, y_vals)):
-                X_tr, y_tr = X_train_enc.iloc[train_idx], y_vals[train_idx]
-                X_va, y_va = X_train_enc.iloc[val_idx], y_vals[val_idx]
+                X_tr = X_train_enc.iloc[train_idx].copy()
+                y_tr = y_vals[train_idx]
+                X_va = X_train_enc.iloc[val_idx].copy()
+                y_va = y_vals[val_idx]
+                X_te = X_test_enc.copy()
+
+                # Сглаженный Out-of-Fold Target Encoding
+                global_y = float(np.mean(y_tr))
+                for c in te_candidates:
+                    raw_tr = X_train[c].iloc[train_idx]
+                    raw_va = X_train[c].iloc[val_idx]
+                    raw_te = X_test[c]
+
+                    grp_stats = pd.Series(y_tr).groupby(raw_tr.values).agg(["mean", "count"])
+                    smoothing = 15.0
+                    smoothed_series = (grp_stats["mean"] * grp_stats["count"] + smoothing * global_y) / (grp_stats["count"] + smoothing)
+                    te_map = smoothed_series.to_dict()
+
+                    col_name = f"oof_te_{c}"
+                    X_tr[col_name] = raw_tr.map(te_map).fillna(global_y).astype(np.float32)
+                    X_va[col_name] = raw_va.map(te_map).fillna(global_y).astype(np.float32)
+                    X_te[col_name] = raw_te.map(te_map).fillna(global_y).astype(np.float32)
 
                 if model_family == "lightgbm":
                     try:
@@ -222,13 +250,13 @@ class ModelPortfolioAgent:
                             callbacks=[lgb.early_stopping(stopping_rounds=70, verbose=False)],
                         )
                         val_p = model.predict(X_va)
-                        t_p = model.predict(X_test_enc)
+                        t_p = model.predict(X_te)
                     except Exception:
                         from sklearn.ensemble import HistGradientBoostingRegressor
                         model = HistGradientBoostingRegressor(max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
                         model.fit(X_tr.fillna(-999), y_tr)
                         val_p = model.predict(X_va.fillna(-999))
-                        t_p = model.predict(X_test_enc.fillna(-999))
+                        t_p = model.predict(X_te.fillna(-999))
 
                 elif model_family == "xgboost":
                     try:
@@ -246,13 +274,13 @@ class ModelPortfolioAgent:
                         )
                         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
                         val_p = model.predict(X_va)
-                        t_p = model.predict(X_test_enc)
+                        t_p = model.predict(X_te)
                     except Exception:
                         from sklearn.ensemble import HistGradientBoostingRegressor
                         model = HistGradientBoostingRegressor(max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
                         model.fit(X_tr.fillna(-999), y_tr)
                         val_p = model.predict(X_va.fillna(-999))
-                        t_p = model.predict(X_test_enc.fillna(-999))
+                        t_p = model.predict(X_te.fillna(-999))
 
                 elif model_family == "hist_gb":
                     from sklearn.ensemble import HistGradientBoostingRegressor
@@ -265,21 +293,21 @@ class ModelPortfolioAgent:
                     )
                     model.fit(X_tr.fillna(-999), y_tr)
                     val_p = model.predict(X_va.fillna(-999))
-                    t_p = model.predict(X_test_enc.fillna(-999))
+                    t_p = model.predict(X_te.fillna(-999))
 
                 else:  # default catboost
                     from catboost import CatBoostRegressor
                     model = CatBoostRegressor(
-                        iterations=1000,
-                        learning_rate=0.05,
-                        depth=6,
+                        iterations=1200,
+                        learning_rate=0.04,
+                        depth=7,
                         thread_count=8,
                         random_seed=42 + fold,
                         verbose=0,
                     )
-                    model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=70, verbose=False)
+                    model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=80, verbose=False)
                     val_p = model.predict(X_va.fillna(-999))
-                    t_p = model.predict(X_test_enc.fillna(-999))
+                    t_p = model.predict(X_te.fillna(-999))
 
                 oof_preds[val_idx] = val_p
                 test_preds += t_p / self.n_splits
@@ -312,11 +340,48 @@ class ModelPortfolioAgent:
             oof_probs = np.zeros((len(y_encoded), num_classes), dtype=np.float32)
             test_probs = np.zeros((len(X_test_enc), num_classes), dtype=np.float32)
 
+            # Смягченные веса классов (Square-Root Balanced) для LightGBM:
+            # Предотвращают 560-кратный взрыв весов и защищают разбиения средних классов
+            if num_classes > 2:
+                counts = np.bincount(y_encoded, minlength=num_classes)
+                raw_w = np.sqrt(len(y_encoded) / (num_classes * np.maximum(counts, 1)))
+                lgb_weights = {i: float(w) for i, w in enumerate(raw_w)}
+            else:
+                lgb_weights = "balanced"
+
+            # Топ-3 категориальные колонки умеренной кардинальности для OOF Target Probability Encoding
+            mc_te_candidates = [
+                c for c in cat_features
+                if c in X_train.columns and 2 <= X_train[c].nunique() <= 150
+            ][:3]
+
             skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
 
             for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_enc, y_encoded)):
-                X_tr, y_tr = X_train_enc.iloc[train_idx], y_encoded[train_idx]
-                X_va, y_va = X_train_enc.iloc[val_idx], y_encoded[val_idx]
+                X_tr = X_train_enc.iloc[train_idx].copy()
+                y_tr = y_encoded[train_idx]
+                X_va = X_train_enc.iloc[val_idx].copy()
+                y_va = y_encoded[val_idx]
+                X_te = X_test_enc.copy()
+
+                # Сглаженный Out-of-Fold Target Probability Encoding по классам (Class Probabilities)
+                for c in mc_te_candidates:
+                    raw_tr = X_train[c].iloc[train_idx]
+                    raw_va = X_train[c].iloc[val_idx]
+                    raw_te = X_test[c]
+
+                    for k in range(num_classes):
+                        y_k = (y_tr == k).astype(np.float32)
+                        prior_k = float(np.mean(y_k))
+                        grp = pd.Series(y_k).groupby(raw_tr.values).agg(["sum", "count"])
+                        smoothing = 10.0
+                        smoothed_p = (grp["sum"] + smoothing * prior_k) / (grp["count"] + smoothing)
+                        te_map_k = smoothed_p.to_dict()
+
+                        col_name = f"oof_te_{c}_c{k}"
+                        X_tr[col_name] = raw_tr.map(te_map_k).fillna(prior_k).astype(np.float32)
+                        X_va[col_name] = raw_va.map(te_map_k).fillna(prior_k).astype(np.float32)
+                        X_te[col_name] = raw_te.map(te_map_k).fillna(prior_k).astype(np.float32)
 
                 if model_family == "lightgbm":
                     try:
@@ -325,7 +390,7 @@ class ModelPortfolioAgent:
                             n_estimators=1000,
                             learning_rate=0.04,
                             num_leaves=45,
-                            class_weight="balanced",
+                            class_weight=lgb_weights,
                             subsample=0.8,
                             colsample_bytree=0.8,
                             random_state=42 + fold,
@@ -338,13 +403,13 @@ class ModelPortfolioAgent:
                             callbacks=[lgb.early_stopping(stopping_rounds=70, verbose=False)],
                         )
                         val_p = model.predict_proba(X_va)
-                        t_p = model.predict_proba(X_test_enc)
+                        t_p = model.predict_proba(X_te)
                     except Exception:
                         from sklearn.ensemble import HistGradientBoostingClassifier
                         model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_depth=8, class_weight="balanced", random_state=42 + fold)
                         model.fit(X_tr.fillna(-999), y_tr)
                         val_p = model.predict_proba(X_va.fillna(-999))
-                        t_p = model.predict_proba(X_test_enc.fillna(-999))
+                        t_p = model.predict_proba(X_te.fillna(-999))
 
                 elif model_family == "xgboost":
                     try:
@@ -362,13 +427,13 @@ class ModelPortfolioAgent:
                         )
                         model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
                         val_p = model.predict_proba(X_va)
-                        t_p = model.predict_proba(X_test_enc)
+                        t_p = model.predict_proba(X_te)
                     except Exception:
                         from sklearn.ensemble import HistGradientBoostingClassifier
                         model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_depth=8, class_weight="balanced", random_state=42 + fold)
                         model.fit(X_tr.fillna(-999), y_tr)
                         val_p = model.predict_proba(X_va.fillna(-999))
-                        t_p = model.predict_proba(X_test_enc.fillna(-999))
+                        t_p = model.predict_proba(X_te.fillna(-999))
 
                 elif model_family == "hist_gb":
                     from sklearn.ensemble import HistGradientBoostingClassifier
@@ -381,7 +446,7 @@ class ModelPortfolioAgent:
                     )
                     model.fit(X_tr.fillna(-999), y_tr)
                     val_p = model.predict_proba(X_va.fillna(-999))
-                    t_p = model.predict_proba(X_test_enc.fillna(-999))
+                    t_p = model.predict_proba(X_te.fillna(-999))
 
                 else:  # default catboost
                     from catboost import CatBoostClassifier
@@ -399,7 +464,7 @@ class ModelPortfolioAgent:
                     )
                     model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=cb_early, verbose=False)
                     val_p = model.predict_proba(X_va.fillna(-999))
-                    t_p = model.predict_proba(X_test_enc.fillna(-999))
+                    t_p = model.predict_proba(X_te.fillna(-999))
 
                 oof_probs[val_idx] = val_p
                 test_probs += t_p / self.n_splits

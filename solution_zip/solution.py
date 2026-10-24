@@ -43,7 +43,7 @@ from model_agent import ModelPortfolioAgent
 from task_profiler import get_task_profile
 
 # Настройки цикла AutoResearch
-MAX_LLM_FEATURE_ITERATIONS = 2
+MAX_LLM_FEATURE_ITERATIONS = 4
 TIME_BUDGET_SECONDS = 9600  # 2.6 часа (лимит платформы 3 часа)
 PATIENCE = 2
 
