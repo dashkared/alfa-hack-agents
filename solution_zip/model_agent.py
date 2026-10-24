@@ -10,7 +10,7 @@ from sklearn.metrics import f1_score, mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
-warnings.filterwarnings("ignore", category=UserWarning)
+warnings.filterwarnings("ignore")
 
 
 class ModelPortfolioAgent:
@@ -216,7 +216,6 @@ class ModelPortfolioAgent:
                 self.fold_indices = list(kf.split(X_train_enc, y_vals))
 
             fold_scores = []
-            early_stopped = False
 
             for fold, (train_idx, val_idx) in enumerate(self.fold_indices):
                 X_tr = X_train_enc.iloc[train_idx].copy()
@@ -353,22 +352,6 @@ class ModelPortfolioAgent:
                 fold_rmse = float(np.sqrt(mean_squared_error(y_va, np.clip(val_p, y_min, y_max))))
                 fold_scores.append(fold_rmse)
 
-                # Multi-Fidelity Screening: проверка после 2 фолдов (PIPELINE.md §9)
-                if fold == 1 and len(self.model_pool) > 0:
-                    cand_2f = float(np.mean(fold_scores[:2]))
-                    best_base = min(self.model_pool.values(), key=lambda m: m["score"])
-                    if "fold_scores" in best_base and len(best_base["fold_scores"]) >= 2:
-                        base_2f = float(np.mean(best_base["fold_scores"][:2]))
-                        lag = (cand_2f - base_2f) / max(base_2f, 1e-5)
-                        if lag > 0.08:
-                            print(f"  ⚡ [Multi-Fidelity] {model_family} отстает на {lag*100:.1f}% после 2 фолдов. Ранняя остановка для экономии ресурсов.")
-                            early_stopped = True
-                            break
-
-            if early_stopped:
-                self.last_fold_scores = fold_scores
-                return 999.0, test_preds, backend_name
-
             # Физический пост-процессинг: ограничение допустимых границ таргета
             oof_preds = np.clip(oof_preds, y_min, y_max)
             test_preds = np.clip(test_preds, y_min, y_max)
@@ -423,7 +406,6 @@ class ModelPortfolioAgent:
                 self.fold_indices = list(skf.split(X_train_enc, y_encoded))
 
             fold_scores = []
-            early_stopped = False
 
             for fold, (train_idx, val_idx) in enumerate(self.fold_indices):
                 X_tr = X_train_enc.iloc[train_idx].copy()
@@ -565,22 +547,6 @@ class ModelPortfolioAgent:
 
                 fold_f1 = float(f1_score(y_va, np.argmax(val_p, axis=1), average="macro"))
                 fold_scores.append(fold_f1)
-
-                # Multi-Fidelity Screening: проверка после 2 фолдов (PIPELINE.md §9)
-                if fold == 1 and len(self.model_pool) > 0:
-                    cand_2f = float(np.mean(fold_scores[:2]))
-                    best_base = max(self.model_pool.values(), key=lambda m: m["score"])
-                    if "fold_scores" in best_base and len(best_base["fold_scores"]) >= 2:
-                        base_2f = float(np.mean(best_base["fold_scores"][:2]))
-                        lag = base_2f - cand_2f
-                        if lag > 0.040:
-                            print(f"  ⚡ [Multi-Fidelity] {model_family} отстает на {lag:.4f} F1 после 2 фолдов. Ранняя остановка для экономии ресурсов.")
-                            early_stopped = True
-                            break
-
-            if early_stopped:
-                self.last_fold_scores = fold_scores
-                return 0.0, label_enc.inverse_transform(np.argmax(test_probs, axis=1)), backend_name
 
             # Тюнинг порогов вероятностей для редких классов
             class_weights = self._optimize_threshold_multipliers(oof_probs, y_encoded)

@@ -304,7 +304,7 @@ def main(task_md_path: Path):
     if profile.task_type == "regression":
         other_models = ["lightgbm", "xgboost", "xgboost_reg_l2"]
     else:
-        other_models = ["xgboost", "catboost", "xgboost_deep"]
+        other_models = ["xgboost", "xgboost_deep", "hist_gb", "catboost"]
 
     fam_labels = {
         "lightgbm": "LightGBM",
@@ -312,6 +312,7 @@ def main(task_md_path: Path):
         "catboost": "CatBoost",
         "xgboost_reg_l2": "XGBoost (L2 Regularized)",
         "xgboost_deep": "XGBoost (Deep Architecture)",
+        "hist_gb": "HistGradientBoosting",
     }
 
     for m_fam in other_models:
