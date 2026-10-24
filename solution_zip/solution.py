@@ -296,10 +296,21 @@ def main(task_md_path: Path):
             )
             print(f"  -> Вердикт Монитора: [{verdict_base.status}] | CV {profile.metric}: {verdict_base.current_cv_score:.4f} (Δ = {verdict_base.delta:+.4f})")
             current_iter += 1
-    other_models = ["xgboost", "catboost"] if base_model == "lightgbm" else ["lightgbm", "xgboost"]
+    if profile.task_type == "regression":
+        other_models = ["lightgbm", "xgboost", "lightgbm_huber"]
+    else:
+        other_models = ["xgboost", "catboost", "xgboost_deep"]
+
+    fam_labels = {
+        "lightgbm": "LightGBM",
+        "xgboost": "XGBoost",
+        "catboost": "CatBoost",
+        "lightgbm_huber": "LightGBM (Huber Loss)",
+        "xgboost_deep": "XGBoost (Deep Architecture)",
+    }
 
     for m_fam in other_models:
-        fam_label = "LightGBM" if m_fam == "lightgbm" else ("XGBoost" if m_fam == "xgboost" else "CatBoost")
+        fam_label = fam_labels.get(m_fam, m_fam)
         print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: {fam_label})]")
         try:
             score_m, preds_m, backend_m = model_agent.train_and_evaluate(

@@ -258,6 +258,36 @@ class ModelPortfolioAgent:
                         val_p = model.predict(X_va.fillna(-999))
                         t_p = model.predict(X_te.fillna(-999))
 
+                elif model_family == "lightgbm_huber":
+                    # Робастная к тяжелым хвостам и выбросам модель с функцией потерь Huber
+                    try:
+                        import lightgbm as lgb
+                        model = lgb.LGBMRegressor(
+                            objective="huber",
+                            alpha=0.9,
+                            n_estimators=1000,
+                            learning_rate=0.04,
+                            num_leaves=45,
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=42 + fold,
+                            verbose=-1,
+                            n_jobs=8,
+                        )
+                        model.fit(
+                            X_tr, y_tr,
+                            eval_set=[(X_va, y_va)],
+                            callbacks=[lgb.early_stopping(stopping_rounds=70, verbose=False)],
+                        )
+                        val_p = model.predict(X_va)
+                        t_p = model.predict(X_te)
+                    except Exception:
+                        from sklearn.ensemble import HistGradientBoostingRegressor
+                        model = HistGradientBoostingRegressor(loss="absolute_error", max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
+                        model.fit(X_tr.fillna(-999), y_tr)
+                        val_p = model.predict(X_va.fillna(-999))
+                        t_p = model.predict(X_te.fillna(-999))
+
                 elif model_family == "xgboost":
                     try:
                         import xgboost as xgb
@@ -435,6 +465,32 @@ class ModelPortfolioAgent:
                         val_p = model.predict_proba(X_va.fillna(-999))
                         t_p = model.predict_proba(X_te.fillna(-999))
 
+                elif model_family == "xgboost_deep":
+                    # Глубокая архитектура XGBoost для выявления сложных сигнатур редких атак (Analysis, Backdoor)
+                    try:
+                        import xgboost as xgb
+                        model = xgb.XGBClassifier(
+                            n_estimators=1000,
+                            learning_rate=0.035,
+                            max_depth=8,
+                            min_child_weight=2,
+                            subsample=0.85,
+                            colsample_bytree=0.7,
+                            tree_method="hist",
+                            random_state=42 + fold,
+                            n_jobs=8,
+                            early_stopping_rounds=70,
+                        )
+                        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+                        val_p = model.predict_proba(X_va)
+                        t_p = model.predict_proba(X_te)
+                    except Exception:
+                        from sklearn.ensemble import HistGradientBoostingClassifier
+                        model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_depth=8, class_weight="balanced", random_state=42 + fold)
+                        model.fit(X_tr.fillna(-999), y_tr)
+                        val_p = model.predict_proba(X_va.fillna(-999))
+                        t_p = model.predict_proba(X_te.fillna(-999))
+
                 elif model_family == "hist_gb":
                     from sklearn.ensemble import HistGradientBoostingClassifier
                     model = HistGradientBoostingClassifier(
@@ -538,14 +594,24 @@ class ModelPortfolioAgent:
                 return float(np.sqrt(mean_squared_error(y_vals, pred)))
 
             # Дискретная сетка кандидатов для надежного старта
-            candidates = []
+            candidates = [np.eye(len(model_names), dtype=np.float32)[i] for i in range(len(model_names))]
+            candidates.append(np.full(len(model_names), 1.0 / len(model_names), dtype=np.float32))
+
             if len(model_names) == 2:
-                candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 41)]
+                candidates.extend([np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 41)])
             elif len(model_names) == 3:
                 for w1 in np.linspace(0.0, 1.0, 21):
                     for w2 in np.linspace(0.0, 1.0 - w1, 21):
                         w3 = max(0.0, 1.0 - w1 - w2)
                         candidates.append(np.array([w1, w2, w3], dtype=np.float32))
+            else:
+                for i in range(len(model_names)):
+                    for j in range(i + 1, len(model_names)):
+                        for w in [0.25, 0.5, 0.75]:
+                            v = np.zeros(len(model_names), dtype=np.float32)
+                            v[i] = w
+                            v[j] = 1.0 - w
+                            candidates.append(v)
 
             for cand_w in candidates:
                 r = objective(cand_w)
@@ -615,12 +681,28 @@ class ModelPortfolioAgent:
 
             if len(model_names) == 2:
                 candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 41)]
-            else:
+            elif len(model_names) == 3:
                 candidates = []
                 for w1 in np.linspace(0.0, 1.0, 21):
                     for w2 in np.linspace(0.0, 1.0 - w1, 21):
                         w3 = max(0.0, 1.0 - w1 - w2)
                         candidates.append(np.array([w1, w2, w3], dtype=np.float32))
+            else:
+                candidates = [np.eye(len(model_names), dtype=np.float32)[i] for i in range(len(model_names))]
+                candidates.append(np.full(len(model_names), 1.0 / len(model_names), dtype=np.float32))
+                for i in range(len(model_names)):
+                    for j in range(i + 1, len(model_names)):
+                        for w in [0.2, 0.35, 0.5, 0.65, 0.8]:
+                            v = np.zeros(len(model_names), dtype=np.float32)
+                            v[i] = w
+                            v[j] = 1.0 - w
+                            candidates.append(v)
+                for w1 in [0.35, 0.5, 0.65]:
+                    for w2 in [0.15, 0.25, 0.35]:
+                        for w3 in [0.05, 0.15]:
+                            rem = 1.0 - w1 - w2 - w3
+                            if rem >= 0:
+                                candidates.append(np.array([w1, w2, w3, rem], dtype=np.float32))
 
             for cand_w in candidates:
                 blend_p_oof = np.zeros_like(p_oofs[0])
