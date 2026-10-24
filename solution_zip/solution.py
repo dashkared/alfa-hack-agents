@@ -43,8 +43,8 @@ from model_agent import ModelPortfolioAgent
 from task_profiler import get_task_profile
 
 # Настройки цикла AutoResearch
-MAX_FEATURE_ITERATIONS = 2
-TIME_BUDGET_SECONDS = 9000  # 2.5 часа (лимит платформы 3 часа)
+MAX_LLM_FEATURE_ITERATIONS = 2
+TIME_BUDGET_SECONDS = 9600  # 2.6 часа (лимит платформы 3 часа)
 PATIENCE = 2
 
 
@@ -81,10 +81,10 @@ def main(task_md_path: Path):
     task_dir = task_md_path.parent
 
     print("=" * 80)
-    print("🤖 ALFA-HACK: MULTI-AGENT AUTORESEARCH & ENSEMBLING SYSTEM (MAS)")
+    print("🤖 ALFA-HACK: MULTI-AGENT AUTORESEARCH & ENSEMBLING SYSTEM (MAS 2.0)")
     print(f"📁 Рабочий каталог: {task_dir}")
     print(f"📄 Паспорт задачи:  {task_md_path.name}")
-    print("⚙️ Пайплайн: Feature Engineering + Pruning + Portfolio (CatBoost/HistGB/ExtraTrees) + Blending")
+    print("⚙️ Пайплайн: Universal Features + LLM Hypotheses + Pruning + Big-3 Portfolio (CB/LGB/XGB) + Blending")
     print("=" * 80)
 
     # -------------------------------------------------------------------------
@@ -146,9 +146,43 @@ def main(task_md_path: Path):
     current_iter = 1
 
     # -------------------------------------------------------------------------
-    # ФАЗА 1: Feature Engineering (Генерация и отбор доменных признаков)
+    # ФАЗА 1: Фундаментальные табличные признаки (Universal Tabular Engine)
     # -------------------------------------------------------------------------
-    for feat_iter in range(1, MAX_FEATURE_ITERATIONS + 1):
+    print(f"\n[Итерация {current_iter}: Universal Tabular Feature Engineering (Агрегации, Частоты, Пропуски)]")
+    try:
+        X_tr_univ, X_te_univ, cats_univ = feature_agent.apply_universal_tabular_features(
+            best_X_train, best_X_test, best_cat_cols
+        )
+        score_univ, preds_univ, _ = model_agent.train_and_evaluate(
+            X_tr_univ, y_train, X_te_univ, cats_univ, model_family="catboost"
+        )
+        verdict_univ = critic.evaluate_experiment(
+            iteration=current_iter,
+            hypothesis_name="Universal Tabular Engine (Group Stats & Freq)",
+            current_cv_score=score_univ,
+            test_predictions=preds_univ,
+            test_ids=test_ids,
+        )
+        print(f"  -> Вердикт Монитора: [{verdict_univ.status}] | CV {profile.metric}: {verdict_univ.current_cv_score:.4f} (Δ = {verdict_univ.delta:+.4f})")
+        print(f"  -> {verdict_univ.critique_for_agents}")
+
+        if verdict_univ.status == "PASS":
+            best_X_train = X_tr_univ
+            best_X_test = X_te_univ
+            best_cat_cols = cats_univ
+            last_feedback = verdict_univ.critique_for_agents
+        else:
+            print(f"  🔄 [Rollback] Откат к состоянию бейзлайна.")
+            last_feedback = verdict_univ.critique_for_agents
+    except Exception as e:
+        print(f"  ⚠️ Ошибка в Universal Tabular Features: {e}")
+
+    current_iter += 1
+
+    # -------------------------------------------------------------------------
+    # ФАЗА 2: LLM FeatureArchitect (Доменные гипотезы и формулы)
+    # -------------------------------------------------------------------------
+    for feat_iter in range(1, MAX_LLM_FEATURE_ITERATIONS + 1):
         elapsed_sec = time.time() - start_time
         if elapsed_sec > TIME_BUDGET_SECONDS:
             print(f"\n⏰ [Coordinator] Превышен бюджет времени. Переход к ансамблированию.")
@@ -159,7 +193,7 @@ def main(task_md_path: Path):
             print(f"\nℹ️ [Coordinator] Признаковое пространство стабилизировалось ({stop_reason}).")
             break
 
-        print(f"\n[Итерация {current_iter}: FeatureArchitect Agent (Гипотеза #{feat_iter})]")
+        print(f"\n[Итерация {current_iter}: FeatureArchitect Agent (LLM Гипотеза #{feat_iter})]")
         transform_fn, hyp_name = feature_agent.generate_feature_transform(
             best_X_train, critique_feedback=last_feedback
         )
@@ -205,7 +239,7 @@ def main(task_md_path: Path):
         current_iter += 1
 
     # -------------------------------------------------------------------------
-    # ФАЗА 2: Очистка признаков (Feature Pruning)
+    # ФАЗА 3: Очистка признаков (Feature Pruning)
     # -------------------------------------------------------------------------
     print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Очистка неинформативных фичей)]")
     try:
@@ -233,49 +267,56 @@ def main(task_md_path: Path):
 
     current_iter += 1
 
+    # Сбрасываем пул моделей перед обучением разнородных архитектур на лучшем наборе признаков
+    model_agent.clear_pool()
+    # Регистрируем CatBoost на лучшем наборе
+    print(f"\n[ModelPortfolio] Фиксация базовой модели CatBoost на лучшем пространстве признаков...")
+    model_agent.train_and_evaluate(
+        best_X_train, y_train, best_X_test, best_cat_cols, model_family="catboost"
+    )
+
     # -------------------------------------------------------------------------
-    # ФАЗА 3: Исследование пространства моделей (Model Portfolio)
-    # Обучение HistGradientBoosting и ExtraTrees на лучших фичах
+    # ФАЗА 4: Исследование пространства моделей (Big-3 Portfolio: LightGBM & XGBoost)
     # -------------------------------------------------------------------------
-    print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: HistGradientBoosting)]")
+    print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: LightGBM)]")
     try:
-        score_hist, preds_hist, backend_hist = model_agent.train_and_evaluate(
-            best_X_train, y_train, best_X_test, best_cat_cols, model_family="hist_gb"
+        score_lgb, preds_lgb, backend_lgb = model_agent.train_and_evaluate(
+            best_X_train, y_train, best_X_test, best_cat_cols, model_family="lightgbm"
         )
-        verdict_hist = critic.evaluate_experiment(
+        verdict_lgb = critic.evaluate_experiment(
             iteration=current_iter,
-            hypothesis_name="Model Diversity: HistGradientBoosting",
-            current_cv_score=score_hist,
-            test_predictions=preds_hist,
+            hypothesis_name="Model Diversity: LightGBM",
+            current_cv_score=score_lgb,
+            test_predictions=preds_lgb,
             test_ids=test_ids,
         )
-        print(f"  -> Вердикт Монитора: [{verdict_hist.status}] | CV {profile.metric}: {verdict_hist.current_cv_score:.4f} (Δ = {verdict_hist.delta:+.4f})")
+        print(f"  -> Вердикт Монитора: [{verdict_lgb.status}] | CV {profile.metric}: {verdict_lgb.current_cv_score:.4f} (Δ = {verdict_lgb.delta:+.4f})")
     except Exception as e:
-        print(f"  ⚠️ Ошибка обучения HistGradientBoosting: {e}")
+        print(f"  ⚠️ Ошибка обучения LightGBM: {e}")
 
     current_iter += 1
 
-    print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: ExtraTrees Bagging)]")
+    print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: XGBoost)]")
     try:
-        score_et, preds_et, backend_et = model_agent.train_and_evaluate(
-            best_X_train, y_train, best_X_test, best_cat_cols, model_family="extra_trees"
+        score_xgb, preds_xgb, backend_xgb = model_agent.train_and_evaluate(
+            best_X_train, y_train, best_X_test, best_cat_cols, model_family="xgboost"
         )
-        verdict_et = critic.evaluate_experiment(
+        verdict_xgb = critic.evaluate_experiment(
             iteration=current_iter,
-            hypothesis_name="Model Diversity: ExtraTrees (Bagging)",
-            current_cv_score=score_et,
-            test_predictions=preds_et,
+            hypothesis_name="Model Diversity: XGBoost",
+            current_cv_score=score_xgb,
+            test_predictions=preds_xgb,
             test_ids=test_ids,
         )
-        print(f"  -> Вердикт Монитора: [{verdict_et.status}] | CV {profile.metric}: {verdict_et.current_cv_score:.4f} (Δ = {verdict_et.delta:+.4f})")
+        print(f"  -> Вердикт Монитора: [{verdict_xgb.status}] | CV {profile.metric}: {verdict_xgb.current_cv_score:.4f} (Δ = {verdict_xgb.delta:+.4f})")
     except Exception as e:
-        print(f"  ⚠️ Ошибка обучения ExtraTrees: {e}")
+        print(f"  ⚠️ Ошибка обучения XGBoost: {e}")
 
     current_iter += 1
 
     # -------------------------------------------------------------------------
-    # ФАЗА 4: Ансамблирование (Ensembling / Blending Agent)
-    # Поиск оптимальных весов смешивания CatBoost + HistGB + ExtraTrees
+    # ФАЗА 5: Ансамблирование (Ensembling / Blending Agent)
+    # Поиск оптимальных весов смешивания CatBoost + LightGBM + XGBoost
     # -------------------------------------------------------------------------
     print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Multi-Model Blending)]")
     try:

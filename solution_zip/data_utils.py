@@ -96,10 +96,10 @@ def load_and_preprocess_data(
 
     for col in common_cols:
         is_num = pd.api.types.is_numeric_dtype(X_train[col])
-        if is_num and X_train[col].nunique() > 20:
-            num_features.append(col)
-        else:
+        if not is_num or X_train[col].dtype == object or str(X_train[col].dtype) == "category":
             cat_features.append(col)
+        else:
+            num_features.append(col)
 
     # Обработка категориальных колонок
     for col in cat_features:

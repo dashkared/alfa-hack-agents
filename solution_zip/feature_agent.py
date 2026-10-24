@@ -20,7 +20,7 @@ class FeatureArchitectAgent:
         self.model = os.environ.get("OPENAI_MODEL", "qwen/qwen3.8-27b")
 
     def _read_data_dictionary_summary(self) -> str:
-        """Считывает словарь данных с русскими описаниями полей."""
+        """Считывает словарь данных с русскими описаниями полей (компактная версия)."""
         dict_path = self.task_dir / "data_dictionary.csv"
         if dict_path.exists():
             try:
@@ -32,7 +32,7 @@ class FeatureArchitectAgent:
                     role = row.get("role", "")
                     if feat and feat != self.profile.target_column and feat != self.profile.id_column:
                         lines.append(f"- `{feat}`: {desc} (тип: {role})")
-                return "\n".join(lines[:60])
+                return "\n".join(lines[:25])
             except Exception:
                 pass
         return "Словарь данных отсутствует или не прочитан."
@@ -92,6 +92,74 @@ class FeatureArchitectAgent:
 
         return df
 
+    def apply_universal_tabular_features(
+        self,
+        X_train: pd.DataFrame,
+        X_test: pd.DataFrame,
+        cat_features: List[str],
+    ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
+        """Фундаментальный генератор табличных фичей: индикаторы пропусков, частоты, групповые агрегаты."""
+        print("[FeatureArchitect] Генерация фундаментальных табличных признаков (Universal Tabular Engine)...")
+        X_tr = X_train.copy()
+        X_te = X_test.copy()
+        new_cats = list(cat_features)
+
+        # 1. Индикаторы пропусков (Missingness Flags) для признаков с пропусками > 3%
+        for col in X_train.columns:
+            na_ratio = float(X_train[col].isna().mean())
+            if na_ratio > 0.03:
+                col_name = f"fe_{col}_isna"
+                X_tr[col_name] = X_train[col].isna().astype(np.float32)
+                X_te[col_name] = X_test[col].isna().astype(np.float32)
+
+        # 2. Частотное кодирование (Frequency Encoding) для всех категориальных признаков
+        for col in cat_features:
+            if col in X_tr.columns:
+                freq = X_tr[col].value_counts(normalize=True)
+                freq_col = f"fe_{col}_freq"
+                X_tr[freq_col] = X_tr[col].map(freq).fillna(0.0).astype(np.float32)
+                X_te[freq_col] = X_te[col].map(freq).fillna(0.0).astype(np.float32)
+
+        # 3. Групповые агрегации признаков (Groupby Statistics: mean & diff)
+        # Находим категориальные колонки с кардинальностью от 2 до 80
+        cand_cats = [c for c in cat_features if c in X_tr.columns and 2 <= X_tr[c].nunique() <= 80]
+        priority_cats = ["facility_type", "building_class", "State_Factor", "proto", "service", "state"]
+        sorted_cats = [c for c in priority_cats if c in cand_cats] + [c for c in cand_cats if c not in priority_cats]
+        active_cats = sorted_cats[:3]
+
+        # Находим числовые колонки с высокой дисперсией
+        num_cols = [c for c in X_tr.columns if pd.api.types.is_numeric_dtype(X_tr[c]) and not c.startswith("fe_")]
+        priority_nums = [
+            "floor_area", "energy_star_rating", "year_built", "cooling_degree_days_c", "heating_degree_days_c",
+            "sbytes", "dbytes", "sttl", "dttl", "dur", "spkts", "dpkts"
+        ]
+        sorted_nums = [c for c in priority_nums if c in num_cols] + [c for c in num_cols if c not in priority_nums]
+        active_nums = sorted_nums[:6]
+
+        for cat in active_cats:
+            for num in active_nums:
+                try:
+                    num_series = pd.to_numeric(X_tr[num], errors="coerce")
+                    grp_means = num_series.groupby(X_tr[cat]).mean()
+                    mean_col = f"fe_{num}_grp_{cat}_mean"
+                    diff_col = f"fe_{num}_diff_{cat}"
+
+                    X_tr[mean_col] = X_tr[cat].map(grp_means).astype(np.float32)
+                    X_te[mean_col] = X_te[cat].map(grp_means).astype(np.float32)
+
+                    X_tr[diff_col] = (pd.to_numeric(X_tr[num], errors="coerce") - X_tr[mean_col]).astype(np.float32)
+                    X_te[diff_col] = (pd.to_numeric(X_te[num], errors="coerce") - X_te[mean_col]).astype(np.float32)
+                except Exception:
+                    pass
+
+        # 4. Доменные эвристики для известных модальностей
+        X_tr = self._apply_domain_fallback_features(X_tr)
+        X_te = self._apply_domain_fallback_features(X_te)
+
+        added_cols = [c for c in X_tr.columns if c not in X_train.columns]
+        print(f"[FeatureArchitect] Фундаментальные фичи созданы ({len(added_cols)} новых колонок): {added_cols[:6]}")
+        return X_tr, X_te, new_cats
+
     def _extract_code(self, raw_code: str) -> str:
         """Извлечение чистого Python-кода из markdown блоков."""
         if "```python" in raw_code:
@@ -117,30 +185,30 @@ class FeatureArchitectAgent:
             print("[FeatureArchitect] LLM API недоступен, применяются доменные преобразования признаков.")
             return self._apply_domain_fallback_features, "Domain heuristic feature engineering pipeline"
 
-        sample_cols = list(df_sample.columns)[:40]
+        sample_cols = list(df_sample.columns)[:25]
         prompt = f"""
 Контекст ML-задачи:
 - Тип задачи: {self.profile.task_type}
 - Целевая колонка: {self.profile.target_column}
 - Метрика: {self.profile.metric} ({self.profile.objective})
 
-Словарь признаков (смысл колонок):
+Словарь ключевых колонок:
 {dict_text}
 
 Доступные колонки в датасете:
 {sample_cols}
 
 Замечания критика с прошлой итерации:
-{critique_feedback if critique_feedback else "Это первая итерация. Сгенерируй 4-6 ключевых доменных признаков."}
+{critique_feedback if critique_feedback else "Это первая итерация. Сгенерируй 3-5 ключевых доменных признаков."}
 
-Напиши компактную и надежную функцию add_features(df).
-ОБЯЗАТЕЛЬНО используй pd.to_numeric(df[col], errors='coerce') перед сложением/вычитанием/делением, чтобы избежать ошибок с типами object!
+ВАЖНО: Рассуждай кратко (не более 2 предложений). Сразу выводи JSON с функцией add_features(df).
+ОБЯЗАТЕЛЬНО используй pd.to_numeric(df[col], errors='coerce') перед сложением/вычитанием/делением!
 """
         import openai
 
         @retry(
-            wait=wait_random_exponential(multiplier=1, max=30),
-            stop=stop_after_attempt(3),
+            wait=wait_random_exponential(multiplier=1, max=20),
+            stop=stop_after_attempt(2),
             retry=retry_if_exception_type((openai.RateLimitError, openai.APIConnectionError, openai.APITimeoutError)),
             reraise=True,
         )
@@ -153,8 +221,8 @@ class FeatureArchitectAgent:
                     {"role": "user", "content": prompt},
                 ],
                 response_format={"type": "json_object"},
-                temperature=0.2,
-                max_tokens=3500,
+                temperature=0.1,
+                max_tokens=6500,
             )
 
         try:
@@ -163,32 +231,33 @@ class FeatureArchitectAgent:
             content = msg.content
             if not content and hasattr(msg, "reasoning_content") and msg.reasoning_content:
                 content = msg.reasoning_content
+            elif not content and hasattr(msg, "provider_specific_fields") and msg.provider_specific_fields:
+                psf = msg.provider_specific_fields
+                content = psf.get("reasoning") or psf.get("reasoning_content") or ""
 
             if not content:
-                raise ValueError("LLM response content is empty")
+                content = str(resp)
 
             match = re.search(r"\{.*\}", content, re.DOTALL)
             raw_json = match.group(0) if match else content
             data = None
 
-            # 1. Попытка стандартного парсинга с разрешением управляющих символов
+            # 1. Попытка стандартного парсинга
             try:
                 data = json.loads(raw_json, strict=False)
             except Exception:
-                # 2. Попытка исправить неэкранированные переносы строк внутри строковых литералов
                 try:
                     fixed_json = re.sub(r'(?<!\\)\n', r'\\n', raw_json)
                     data = json.loads(fixed_json, strict=False)
                 except Exception:
                     pass
 
-            # 3. Если JSON распарсился — создаем FeatureProposal
+            # 2. Если JSON распарсился — извлекаем FeatureProposal
             if data and isinstance(data, dict):
                 proposal = FeatureProposal(**data)
                 code = self._extract_code(proposal.python_code)
             else:
-                # 4. Если JSON поврежден (например, неэкранированные кавычки в коде),
-                # вытаскиваем функцию def add_features напрямую через регулярное выражение!
+                # 3. Регулярное выражение для извлечения def add_features напрямую
                 code_match = re.search(r"(def add_features\(.*?\):\n(?:[ \t]+.*?\n)+)", content)
                 if code_match:
                     code = code_match.group(1)
@@ -199,6 +268,7 @@ class FeatureArchitectAgent:
                     print("[FeatureArchitect] Функция add_features успешно извлечена напрямую из текста модели в обход поврежденного JSON.")
                 else:
                     raise ValueError("Не удалось распарсить JSON и не найдена функция add_features")
+
             print(f"[FeatureArchitect] Получено {len(proposal.hypotheses)} гипотез признаков:")
             for h in proposal.hypotheses:
                 print(f"  • {h.feature_name}: {h.rationale}")
@@ -209,7 +279,6 @@ class FeatureArchitectAgent:
 
             if "add_features" in local_scope and callable(local_scope["add_features"]):
                 transform_fn = local_scope["add_features"]
-                # Тестируем на 20 строках сэмпла
                 test_out = transform_fn(df_sample.head(20))
                 if isinstance(test_out, pd.DataFrame) and len(test_out) == 20:
                     new_cols = set(test_out.columns) - set(df_sample.columns)

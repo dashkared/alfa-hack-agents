@@ -1,3 +1,4 @@
+import warnings
 from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
@@ -7,13 +8,15 @@ from sklearn.metrics import f1_score, mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
 
+warnings.filterwarnings("ignore", category=UserWarning)
+
 
 class ModelPortfolioAgent:
     """Агент 3: ML-Архитектор.
 
-    Управляет портфелем разнообразных семейств моделей (CatBoost, HistGradientBoosting, ExtraTrees),
+    Управляет портфелем моделей «Большой тройки» (CatBoost, LightGBM, XGBoost),
     выполняет очистку неинформативных признаков (Feature Pruning),
-    оптимизирует пороги вероятностей и строит оптимальные ансамбли (OOF Blending).
+    оптимизирует многомерные пороги для редких классов и строит оптимальные ансамбли (OOF Blending).
     """
 
     def __init__(self, profile: TaskProfile, n_splits: int = 5):
@@ -33,13 +36,13 @@ class ModelPortfolioAgent:
         y_train: pd.Series,
         cat_features: List[str],
     ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str], List[str]]:
-        """Отбор признаков (Feature Pruning): удаление константных признаков и шума."""
+        """Отбор признаков (Feature Pruning): удаление константных колонок и нулевого шума."""
         print("[ModelPortfolio] Запуск фильтрации неинформативных признаков (Feature Pruning)...")
-        # 1. Поиск константных признаков
+        # 1. Константные колонки
         constant_cols = [c for c in X_train.columns if X_train[c].nunique() <= 1]
 
         # 2. Быстрая оценка важности через CatBoost на сэмпле данных
-        sample_size = min(len(X_train), 5000)
+        sample_size = min(len(X_train), 6000)
         X_sample = X_train.iloc[:sample_size].copy()
         y_sample = y_train.iloc[:sample_size]
 
@@ -53,13 +56,13 @@ class ModelPortfolioAgent:
             from catboost import CatBoostClassifier, CatBoostRegressor
 
             if self.profile.task_type == "regression":
-                cb = CatBoostRegressor(iterations=60, depth=4, verbose=0, thread_count=8)
-                cb.fit(X_sample.fillna(0), y_sample.values.astype(np.float32))
+                cb = CatBoostRegressor(iterations=70, depth=4, verbose=0, thread_count=8)
+                cb.fit(X_sample.fillna(-999), y_sample.values.astype(np.float32))
             else:
                 le_y = LabelEncoder()
                 y_enc = le_y.fit_transform(y_sample.astype(str))
-                cb = CatBoostClassifier(iterations=60, depth=4, verbose=0, thread_count=8)
-                cb.fit(X_sample.fillna(0), y_enc)
+                cb = CatBoostClassifier(iterations=70, depth=4, verbose=0, thread_count=8)
+                cb.fit(X_sample.fillna(-999), y_enc)
 
             fi = cb.get_feature_importance()
             for col, imp in zip(X_sample.columns, fi):
@@ -89,29 +92,40 @@ class ModelPortfolioAgent:
     def _optimize_threshold_multipliers(
         self, oof_probs: np.ndarray, y_true: np.ndarray, verbose: bool = True
     ) -> np.ndarray:
-        """Оптимизация весов классов для максимизации Macro F1 при сильном дисбалансе."""
+        """Многомерная координатная оптимизация весов классов для максимизации Macro F1."""
         num_classes = oof_probs.shape[1]
         best_weights = np.ones(num_classes, dtype=np.float32)
 
         baseline_preds = np.argmax(oof_probs, axis=1)
-        best_score = f1_score(y_true, baseline_preds, average="macro")
+        best_score = float(f1_score(y_true, baseline_preds, average="macro"))
+        initial_score = best_score
 
-        for c in range(num_classes):
-            candidates = [0.5, 0.8, 1.2, 1.5, 2.0, 3.0, 4.0, 5.0]
-            for mult in candidates:
-                test_weights = best_weights.copy()
-                test_weights[c] = mult
-                scaled_probs = oof_probs * test_weights
-                preds = np.argmax(scaled_probs, axis=1)
-                score = f1_score(y_true, preds, average="macro")
-                if score > best_score:
-                    best_score = score
-                    best_weights[c] = mult
+        # Геометрическая сетка множителей (позволяет редким классам получить буст до 60x)
+        candidates = [0.1, 0.25, 0.5, 0.75, 1.0, 1.35, 1.8, 2.5, 3.5, 5.0, 8.0, 15.0, 30.0, 60.0]
+
+        # 3 прохода координатного спуска
+        for n_pass in range(3):
+            improved = False
+            for c in range(num_classes):
+                best_w_c = best_weights[c]
+                for mult in candidates:
+                    test_weights = best_weights.copy()
+                    test_weights[c] = mult
+                    scaled_probs = oof_probs * test_weights
+                    preds = np.argmax(scaled_probs, axis=1)
+                    score = float(f1_score(y_true, preds, average="macro"))
+                    if score > best_score:
+                        best_score = score
+                        best_w_c = mult
+                        improved = True
+                best_weights[c] = best_w_c
+            if not improved:
+                break
 
         if verbose:
             print(
                 f"[ModelPortfolio] Оптимизация порогов: Macro F1 вырос с "
-                f"{f1_score(y_true, baseline_preds, average='macro'):.4f} до {best_score:.4f}!"
+                f"{initial_score:.4f} до {best_score:.4f}!"
             )
         return best_weights
 
@@ -123,11 +137,11 @@ class ModelPortfolioAgent:
         cat_features: List[str],
         model_family: str = "catboost",
     ) -> Tuple[float, np.ndarray, str]:
-        """Обучение выбранной архитектуры с 5-Fold кросс-валидацией."""
+        """Обучение выбранной архитектуры («Большая тройка»: CatBoost / LightGBM / XGBoost) с 5-Fold CV."""
         X_train_enc = X_train.copy()
         X_test_enc = X_test.copy()
 
-        # Кодирование категориальных признаков
+        # Кодирование категориальных признаков через Label Encoding
         for col in cat_features:
             if col in X_train_enc.columns:
                 le = LabelEncoder()
@@ -153,43 +167,83 @@ class ModelPortfolioAgent:
                 X_tr, y_tr = X_train_enc.iloc[train_idx], y_vals[train_idx]
                 X_va, y_va = X_train_enc.iloc[val_idx], y_vals[val_idx]
 
-                if model_family == "hist_gb":
+                if model_family == "lightgbm":
+                    try:
+                        import lightgbm as lgb
+                        model = lgb.LGBMRegressor(
+                            n_estimators=1000,
+                            learning_rate=0.04,
+                            num_leaves=45,
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=42 + fold,
+                            verbose=-1,
+                            n_jobs=8,
+                        )
+                        model.fit(
+                            X_tr, y_tr,
+                            eval_set=[(X_va, y_va)],
+                            callbacks=[lgb.early_stopping(stopping_rounds=70, verbose=False)],
+                        )
+                        val_p = model.predict(X_va)
+                        t_p = model.predict(X_test_enc)
+                    except Exception:
+                        from sklearn.ensemble import HistGradientBoostingRegressor
+                        model = HistGradientBoostingRegressor(max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
+                        model.fit(X_tr.fillna(-999), y_tr)
+                        val_p = model.predict(X_va.fillna(-999))
+                        t_p = model.predict(X_test_enc.fillna(-999))
+
+                elif model_family == "xgboost":
+                    try:
+                        import xgboost as xgb
+                        model = xgb.XGBRegressor(
+                            n_estimators=1000,
+                            learning_rate=0.04,
+                            max_depth=6,
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            tree_method="hist",
+                            random_state=42 + fold,
+                            n_jobs=8,
+                            early_stopping_rounds=70,
+                        )
+                        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+                        val_p = model.predict(X_va)
+                        t_p = model.predict(X_test_enc)
+                    except Exception:
+                        from sklearn.ensemble import HistGradientBoostingRegressor
+                        model = HistGradientBoostingRegressor(max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
+                        model.fit(X_tr.fillna(-999), y_tr)
+                        val_p = model.predict(X_va.fillna(-999))
+                        t_p = model.predict(X_test_enc.fillna(-999))
+
+                elif model_family == "hist_gb":
                     from sklearn.ensemble import HistGradientBoostingRegressor
                     model = HistGradientBoostingRegressor(
-                        max_iter=350,
-                        learning_rate=0.07,
+                        max_iter=400,
+                        learning_rate=0.06,
                         max_depth=8,
                         min_samples_leaf=20,
                         random_state=42 + fold,
                     )
-                    model.fit(X_tr, y_tr)
-                    val_p = model.predict(X_va)
-                    t_p = model.predict(X_test_enc)
-                elif model_family == "extra_trees":
-                    from sklearn.ensemble import ExtraTreesRegressor
-                    model = ExtraTreesRegressor(
-                        n_estimators=120,
-                        max_depth=12,
-                        min_samples_leaf=4,
-                        n_jobs=8,
-                        random_state=42 + fold,
-                    )
-                    model.fit(X_tr.fillna(0), y_tr)
-                    val_p = model.predict(X_va.fillna(0))
-                    t_p = model.predict(X_test_enc.fillna(0))
+                    model.fit(X_tr.fillna(-999), y_tr)
+                    val_p = model.predict(X_va.fillna(-999))
+                    t_p = model.predict(X_test_enc.fillna(-999))
+
                 else:  # default catboost
                     from catboost import CatBoostRegressor
                     model = CatBoostRegressor(
-                        iterations=700,
-                        learning_rate=0.07,
+                        iterations=1000,
+                        learning_rate=0.05,
                         depth=6,
                         thread_count=8,
                         random_seed=42 + fold,
                         verbose=0,
                     )
-                    model.fit(X_tr, y_tr, eval_set=(X_va, y_va), early_stopping_rounds=60, verbose=False)
-                    val_p = model.predict(X_va)
-                    t_p = model.predict(X_test_enc)
+                    model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=70, verbose=False)
+                    val_p = model.predict(X_va.fillna(-999))
+                    t_p = model.predict(X_test_enc.fillna(-999))
 
                 oof_preds[val_idx] = val_p
                 test_preds += t_p / self.n_splits
@@ -228,36 +282,76 @@ class ModelPortfolioAgent:
                 X_tr, y_tr = X_train_enc.iloc[train_idx], y_encoded[train_idx]
                 X_va, y_va = X_train_enc.iloc[val_idx], y_encoded[val_idx]
 
-                if model_family == "hist_gb":
+                if model_family == "lightgbm":
+                    try:
+                        import lightgbm as lgb
+                        model = lgb.LGBMClassifier(
+                            n_estimators=1000,
+                            learning_rate=0.04,
+                            num_leaves=45,
+                            class_weight="balanced",
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            random_state=42 + fold,
+                            verbose=-1,
+                            n_jobs=8,
+                        )
+                        model.fit(
+                            X_tr, y_tr,
+                            eval_set=[(X_va, y_va)],
+                            callbacks=[lgb.early_stopping(stopping_rounds=70, verbose=False)],
+                        )
+                        val_p = model.predict_proba(X_va)
+                        t_p = model.predict_proba(X_test_enc)
+                    except Exception:
+                        from sklearn.ensemble import HistGradientBoostingClassifier
+                        model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_depth=8, class_weight="balanced", random_state=42 + fold)
+                        model.fit(X_tr.fillna(-999), y_tr)
+                        val_p = model.predict_proba(X_va.fillna(-999))
+                        t_p = model.predict_proba(X_test_enc.fillna(-999))
+
+                elif model_family == "xgboost":
+                    try:
+                        import xgboost as xgb
+                        model = xgb.XGBClassifier(
+                            n_estimators=1000,
+                            learning_rate=0.04,
+                            max_depth=6,
+                            subsample=0.8,
+                            colsample_bytree=0.8,
+                            tree_method="hist",
+                            random_state=42 + fold,
+                            n_jobs=8,
+                            early_stopping_rounds=70,
+                        )
+                        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
+                        val_p = model.predict_proba(X_va)
+                        t_p = model.predict_proba(X_test_enc)
+                    except Exception:
+                        from sklearn.ensemble import HistGradientBoostingClassifier
+                        model = HistGradientBoostingClassifier(max_iter=300, learning_rate=0.06, max_depth=8, class_weight="balanced", random_state=42 + fold)
+                        model.fit(X_tr.fillna(-999), y_tr)
+                        val_p = model.predict_proba(X_va.fillna(-999))
+                        t_p = model.predict_proba(X_test_enc.fillna(-999))
+
+                elif model_family == "hist_gb":
                     from sklearn.ensemble import HistGradientBoostingClassifier
                     model = HistGradientBoostingClassifier(
-                        max_iter=300,
-                        learning_rate=0.07,
+                        max_iter=350,
+                        learning_rate=0.06,
                         max_depth=8,
                         class_weight="balanced",
                         random_state=42 + fold,
                     )
-                    model.fit(X_tr, y_tr)
-                    val_p = model.predict_proba(X_va)
-                    t_p = model.predict_proba(X_test_enc)
-                elif model_family == "extra_trees":
-                    from sklearn.ensemble import ExtraTreesClassifier
-                    model = ExtraTreesClassifier(
-                        n_estimators=120,
-                        max_depth=12,
-                        min_samples_leaf=4,
-                        class_weight="balanced",
-                        n_jobs=8,
-                        random_state=42 + fold,
-                    )
-                    model.fit(X_tr.fillna(0), y_tr)
-                    val_p = model.predict_proba(X_va.fillna(0))
-                    t_p = model.predict_proba(X_test_enc.fillna(0))
+                    model.fit(X_tr.fillna(-999), y_tr)
+                    val_p = model.predict_proba(X_va.fillna(-999))
+                    t_p = model.predict_proba(X_test_enc.fillna(-999))
+
                 else:  # default catboost
                     from catboost import CatBoostClassifier
                     model = CatBoostClassifier(
-                        iterations=700,
-                        learning_rate=0.07,
+                        iterations=1000,
+                        learning_rate=0.05,
                         depth=6,
                         loss_function="MultiClass" if num_classes > 2 else "Logloss",
                         auto_class_weights="Balanced",
@@ -265,9 +359,9 @@ class ModelPortfolioAgent:
                         random_seed=42 + fold,
                         verbose=0,
                     )
-                    model.fit(X_tr, y_tr, eval_set=(X_va, y_va), early_stopping_rounds=60, verbose=False)
-                    val_p = model.predict_proba(X_va)
-                    t_p = model.predict_proba(X_test_enc)
+                    model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=70, verbose=False)
+                    val_p = model.predict_proba(X_va.fillna(-999))
+                    t_p = model.predict_proba(X_test_enc.fillna(-999))
 
                 oof_probs[val_idx] = val_p
                 test_probs += t_p / self.n_splits
@@ -325,25 +419,23 @@ class ModelPortfolioAgent:
                 pred = np.clip(pred, y_min, y_max)
                 return float(np.sqrt(mean_squared_error(y_vals, pred)))
 
-            # Сетка весов от 0.0 до 1.0 (включая 0.0 для отсечения слабых моделей)
+            # Дискретная сетка кандидатов для надежного старта
+            candidates = []
             if len(model_names) == 2:
-                for w in np.linspace(0.0, 1.0, 21):
-                    cand_w = np.array([w, 1.0 - w], dtype=np.float32)
-                    r = objective(cand_w)
-                    if r < best_rmse:
-                        best_rmse = r
-                        best_weights = cand_w
-            else:
-                for w1 in np.linspace(0.0, 1.0, 21):
-                    for w2 in np.linspace(0.0, 1.0 - w1, 21):
+                candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 21)]
+            elif len(model_names) == 3:
+                for w1 in np.linspace(0.0, 1.0, 15):
+                    for w2 in np.linspace(0.0, 1.0 - w1, 15):
                         w3 = max(0.0, 1.0 - w1 - w2)
-                        cand_w = np.array([w1, w2, w3], dtype=np.float32)
-                        r = objective(cand_w)
-                        if r < best_rmse:
-                            best_rmse = r
-                            best_weights = cand_w
+                        candidates.append(np.array([w1, w2, w3], dtype=np.float32))
 
-            # Дополнительная непрерывная оптимизация через SLSQP
+            for cand_w in candidates:
+                r = objective(cand_w)
+                if r < best_rmse:
+                    best_rmse = r
+                    best_weights = cand_w
+
+            # Непрерывная оптимизация через SLSQP
             try:
                 from scipy.optimize import minimize
                 bounds = [(0.0, 1.0) for _ in model_names]
@@ -387,8 +479,8 @@ class ModelPortfolioAgent:
                 candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 21)]
             else:
                 candidates = []
-                for w1 in np.linspace(0.0, 1.0, 21):
-                    for w2 in np.linspace(0.0, 1.0 - w1, 21):
+                for w1 in np.linspace(0.0, 1.0, 15):
+                    for w2 in np.linspace(0.0, 1.0 - w1, 15):
                         w3 = max(0.0, 1.0 - w1 - w2)
                         candidates.append(np.array([w1, w2, w3], dtype=np.float32))
 
