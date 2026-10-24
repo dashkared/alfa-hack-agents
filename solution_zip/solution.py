@@ -172,7 +172,7 @@ def main(task_md_path: Path):
         print(f"  -> Вердикт Монитора: [{verdict_univ.status}] | CV {profile.metric}: {verdict_univ.current_cv_score:.4f} (Δ = {verdict_univ.delta:+.4f})")
         print(f"  -> {verdict_univ.critique_for_agents}")
 
-        if verdict_univ.status == "PASS":
+        if verdict_univ.status == "PASS" or verdict_univ.is_improvement:
             best_X_train = X_tr_univ
             best_X_test = X_te_univ
             best_cat_cols = cats_univ
@@ -229,7 +229,7 @@ def main(task_md_path: Path):
             print(f"  -> Вердикт Монитора: [{verdict_i.status}] | CV {profile.metric}: {verdict_i.current_cv_score:.4f} (Δ = {verdict_i.delta:+.4f})")
             print(f"  -> {verdict_i.critique_for_agents}")
 
-            if verdict_i.status == "PASS":
+            if verdict_i.status == "PASS" or verdict_i.is_improvement:
                 best_X_train = X_train_cand
                 best_X_test = X_test_cand
                 best_cat_cols = cand_cats
@@ -264,7 +264,7 @@ def main(task_md_path: Path):
                 test_ids=test_ids,
             )
             print(f"  -> Вердикт Монитора: [{verdict_pruned.status}] | CV {profile.metric}: {verdict_pruned.current_cv_score:.4f} (Δ = {verdict_pruned.delta:+.4f})")
-            if verdict_pruned.status == "PASS":
+            if verdict_pruned.status == "PASS" or verdict_pruned.is_improvement:
                 best_X_train, best_X_test, best_cat_cols = pruned_X_tr, pruned_X_te, pruned_cats
             else:
                 print(f"  🔄 [Rollback] Очистка не улучшила скор, сохранен полный набор фичей.")
@@ -273,17 +273,29 @@ def main(task_md_path: Path):
 
     current_iter += 1
 
+    # -------------------------------------------------------------------------
+    # ФАЗА 4: Исследование пространства моделей («Большая тройка»: CatBoost, LightGBM, XGBoost)
+    # -------------------------------------------------------------------------
     # Сбрасываем пул моделей перед обучением разнородных архитектур на лучшем наборе признаков
     model_agent.clear_pool()
     # Регистрируем базовую модель на лучшем пространстве признаков
     print(f"\n[ModelPortfolio] Фиксация базовой модели {base_model_label} на лучшем пространстве признаков...")
-    model_agent.train_and_evaluate(
+    score_base, preds_base, _ = model_agent.train_and_evaluate(
         best_X_train, y_train, best_X_test, best_cat_cols, model_family=base_model
     )
-
-    # -------------------------------------------------------------------------
-    # ФАЗА 4: Исследование пространства моделей («Большая тройка»: CatBoost, LightGBM, XGBoost)
-    # -------------------------------------------------------------------------
+    if critic.best_score is not None:
+        is_min = (profile.objective == "minimize")
+        is_improved = (score_base < critic.best_score) if is_min else (score_base > critic.best_score)
+        if is_improved:
+            verdict_base = critic.evaluate_experiment(
+                iteration=current_iter,
+                hypothesis_name=f"Base Model ({base_model_label}) on Refined Features",
+                current_cv_score=score_base,
+                test_predictions=preds_base,
+                test_ids=test_ids,
+            )
+            print(f"  -> Вердикт Монитора: [{verdict_base.status}] | CV {profile.metric}: {verdict_base.current_cv_score:.4f} (Δ = {verdict_base.delta:+.4f})")
+            current_iter += 1
     other_models = ["xgboost", "catboost"] if base_model == "lightgbm" else ["lightgbm", "xgboost"]
 
     for m_fam in other_models:

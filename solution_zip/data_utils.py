@@ -131,13 +131,25 @@ def save_atomic_submission(
         profile.target_column: predictions,
     })
 
+    # Синхронизация структуры с sample_submission.csv (названия колонок и типы)
+    sample_sub_path = task_dir / "sample_submission.csv"
+    if sample_sub_path.exists():
+        try:
+            sample_df = pd.read_csv(sample_sub_path, nrows=5)
+            if len(sample_df.columns) == 2:
+                sub_df.columns = list(sample_df.columns)
+            sub_df[sub_df.columns[0]] = sub_df[sub_df.columns[0]].astype(sample_df[sample_df.columns[0]].dtype)
+        except Exception:
+            pass
+
     # Проверка на пропуски или бесконечности
-    if sub_df[profile.target_column].isnull().any():
+    target_c = sub_df.columns[1]
+    if sub_df[target_c].isnull().any():
         print("[DataUtils] ВНИМАНИЕ: Обнаружены NaN в предсказаниях! Заполняем дефолтным значением.")
         if profile.task_type == "regression":
-            sub_df[profile.target_column] = sub_df[profile.target_column].fillna(0.0)
+            sub_df[target_c] = sub_df[target_c].fillna(0.0)
         else:
-            sub_df[profile.target_column] = sub_df[profile.target_column].fillna(sub_df[profile.target_column].mode()[0])
+            sub_df[target_c] = sub_df[target_c].fillna(sub_df[target_c].mode()[0])
 
     # Запись во временный файл и атомарный rename
     sub_df.to_csv(temp_path, index=False, encoding="utf-8")

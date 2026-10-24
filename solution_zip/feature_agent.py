@@ -124,13 +124,45 @@ class FeatureArchitectAgent:
         X_test: pd.DataFrame,
         cat_features: List[str],
     ) -> Tuple[pd.DataFrame, pd.DataFrame, List[str]]:
-        """Фундаментальный генератор табличных фичей: индикаторы пропусков, частоты, групповые агрегаты."""
+        """Фундаментальный генератор табличных фичей: даты, индикаторы пропусков, частоты, сглаженные групповые агрегаты."""
         print("[FeatureArchitect] Генерация фундаментальных табличных признаков (Universal Tabular Engine)...")
         X_tr = X_train.copy()
         X_te = X_test.copy()
         new_cats = list(cat_features)
 
-        # 1. Индикаторы пропусков (Missingness Flags) для признаков с пропусками > 3%
+        # 1. Автоматическое распознавание дат и извлечение календарных признаков
+        for col in X_train.columns:
+            if col in cat_features or X_train[col].dtype == object:
+                sample_s = X_train[col].dropna().astype(str).head(30)
+                if not sample_s.empty and sample_s.str.contains(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}|\d{1,2}[-/]\d{1,2}[-/]\d{2,4}").mean() > 0.5:
+                    try:
+                        tr_dt = pd.to_datetime(X_tr[col], errors="coerce")
+                        te_dt = pd.to_datetime(X_te[col], errors="coerce")
+                        if tr_dt.notna().mean() > 0.5:
+                            X_tr[f"fe_{col}_year"] = tr_dt.dt.year.astype(np.float32)
+                            X_tr[f"fe_{col}_month"] = tr_dt.dt.month.astype(np.float32)
+                            X_tr[f"fe_{col}_day"] = tr_dt.dt.day.astype(np.float32)
+                            X_tr[f"fe_{col}_dow"] = tr_dt.dt.dayofweek.astype(np.float32)
+                            X_tr[f"fe_{col}_is_weekend"] = (tr_dt.dt.dayofweek >= 5).astype(np.float32)
+
+                            X_te[f"fe_{col}_year"] = te_dt.dt.year.astype(np.float32)
+                            X_te[f"fe_{col}_month"] = te_dt.dt.month.astype(np.float32)
+                            X_te[f"fe_{col}_day"] = te_dt.dt.day.astype(np.float32)
+                            X_te[f"fe_{col}_dow"] = te_dt.dt.dayofweek.astype(np.float32)
+                            X_te[f"fe_{col}_is_weekend"] = (te_dt.dt.dayofweek >= 5).astype(np.float32)
+
+                            if (tr_dt.dt.hour != 0).any():
+                                X_tr[f"fe_{col}_hour"] = tr_dt.dt.hour.astype(np.float32)
+                                X_tr[f"fe_{col}_hour_sin"] = np.sin(2 * np.pi * tr_dt.dt.hour / 24.0).astype(np.float32)
+                                X_tr[f"fe_{col}_hour_cos"] = np.cos(2 * np.pi * tr_dt.dt.hour / 24.0).astype(np.float32)
+
+                                X_te[f"fe_{col}_hour"] = te_dt.dt.hour.astype(np.float32)
+                                X_te[f"fe_{col}_hour_sin"] = np.sin(2 * np.pi * te_dt.dt.hour / 24.0).astype(np.float32)
+                                X_te[f"fe_{col}_hour_cos"] = np.cos(2 * np.pi * te_dt.dt.hour / 24.0).astype(np.float32)
+                    except Exception:
+                        pass
+
+        # 2. Индикаторы пропусков (Missingness Flags) для признаков с пропусками > 3%
         for col in X_train.columns:
             na_ratio = float(X_train[col].isna().mean())
             if na_ratio > 0.03:
@@ -138,7 +170,7 @@ class FeatureArchitectAgent:
                 X_tr[col_name] = X_train[col].isna().astype(np.float32)
                 X_te[col_name] = X_test[col].isna().astype(np.float32)
 
-        # 2. Частотное кодирование (Frequency Encoding) для всех категориальных признаков
+        # 3. Частотное кодирование (Frequency Encoding) для всех категориальных признаков
         for col in cat_features:
             if col in X_tr.columns:
                 freq = X_tr[col].value_counts(normalize=True)
@@ -146,7 +178,7 @@ class FeatureArchitectAgent:
                 X_tr[freq_col] = X_tr[col].map(freq).fillna(0.0).astype(np.float32)
                 X_te[freq_col] = X_te[col].map(freq).fillna(0.0).astype(np.float32)
 
-        # 3. Групповые агрегации признаков (Groupby Statistics: mean & diff)
+        # 4. Сглаженные групповые агрегации (Bayesian Shrinkage Groupby Statistics: mean & diff)
         # Находим категориальные колонки с кардинальностью от 2 до 80
         cand_cats = [c for c in cat_features if c in X_tr.columns and 2 <= X_tr[c].nunique() <= 80]
         priority_cats = ["facility_type", "building_class", "State_Factor", "proto", "service", "state"]
@@ -166,19 +198,35 @@ class FeatureArchitectAgent:
             for num in active_nums:
                 try:
                     num_series = pd.to_numeric(X_tr[num], errors="coerce")
-                    grp_means = num_series.groupby(X_tr[cat]).mean()
+                    global_mean = float(num_series.dropna().mean()) if not num_series.dropna().empty else 0.0
+                    grp_stats = num_series.groupby(X_tr[cat]).agg(["mean", "count"])
+                    smoothing = 10.0
+                    smoothed_mean = (grp_stats["mean"] * grp_stats["count"] + smoothing * global_mean) / (grp_stats["count"] + smoothing)
                     mean_col = f"fe_{num}_grp_{cat}_mean"
                     diff_col = f"fe_{num}_diff_{cat}"
 
-                    X_tr[mean_col] = X_tr[cat].map(grp_means).astype(np.float32)
-                    X_te[mean_col] = X_te[cat].map(grp_means).astype(np.float32)
+                    X_tr[mean_col] = X_tr[cat].map(smoothed_mean).fillna(global_mean).astype(np.float32)
+                    X_te[mean_col] = X_te[cat].map(smoothed_mean).fillna(global_mean).astype(np.float32)
 
-                    X_tr[diff_col] = (pd.to_numeric(X_tr[num], errors="coerce") - X_tr[mean_col]).astype(np.float32)
-                    X_te[diff_col] = (pd.to_numeric(X_te[num], errors="coerce") - X_te[mean_col]).astype(np.float32)
+                    X_tr[diff_col] = (pd.to_numeric(X_tr[num], errors="coerce").fillna(global_mean) - X_tr[mean_col]).astype(np.float32)
+                    X_te[diff_col] = (pd.to_numeric(X_te[num], errors="coerce").fillna(global_mean) - X_te[mean_col]).astype(np.float32)
                 except Exception:
                     pass
 
-        # 4. Доменные эвристики для известных модальностей
+        # 5. Отношения ключевых числовых величин
+        if len(active_nums) >= 2:
+            n1, n2 = active_nums[0], active_nums[1]
+            try:
+                s1 = pd.to_numeric(X_tr[n1], errors="coerce").fillna(0).astype(np.float32)
+                s2 = pd.to_numeric(X_tr[n2], errors="coerce").fillna(0).astype(np.float32)
+                t1 = pd.to_numeric(X_te[n1], errors="coerce").fillna(0).astype(np.float32)
+                t2 = pd.to_numeric(X_te[n2], errors="coerce").fillna(0).astype(np.float32)
+                X_tr[f"fe_{n1}_div_{n2}"] = s1 / (s2.abs() + 1.0)
+                X_te[f"fe_{n1}_div_{n2}"] = t1 / (t2.abs() + 1.0)
+            except Exception:
+                pass
+
+        # 6. Доменные эвристики для известных модальностей
         X_tr = self._apply_domain_fallback_features(X_tr)
         X_te = self._apply_domain_fallback_features(X_te)
 

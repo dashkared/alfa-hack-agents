@@ -92,7 +92,10 @@ class ModelPortfolioAgent:
     def _optimize_threshold_multipliers(
         self, oof_probs: np.ndarray, y_true: np.ndarray, verbose: bool = True
     ) -> np.ndarray:
-        """Многомерная координатная оптимизация весов классов для максимизации Macro F1."""
+        """Частотно-адаптивная координатная оптимизация весов классов для максимизации Macro F1.
+        Редкие и ультра-редкие классы (например, Worms с 0.07% выборки) получают расширенную сетку множителей,
+        а частые классы — узкую сетку для предотвращения ложноположительных срабатываний.
+        """
         num_classes = oof_probs.shape[1]
         best_weights = np.ones(num_classes, dtype=np.float32)
 
@@ -100,15 +103,36 @@ class ModelPortfolioAgent:
         best_score = float(f1_score(y_true, baseline_preds, average="macro"))
         initial_score = best_score
 
-        # Геометрическая сетка Precision-Guard: предотвращает лавинообразные ложные срабатывания (False Positives)
-        candidates = [0.25, 0.45, 0.65, 0.85, 1.0, 1.25, 1.6, 2.0, 2.8, 3.8]
+        total_samples = len(y_true)
+        class_counts = np.bincount(y_true, minlength=num_classes)
+        class_freqs = class_counts / max(total_samples, 1)
 
-        # 3 прохода координатного спуска
-        for n_pass in range(3):
+        def get_candidates_for_class(freq: float) -> List[float]:
+            if freq >= 0.15:
+                # Мажорные классы (например, Normal, Generic): узкий диапазон, защита от ложных срабатываний
+                return [0.5, 0.75, 0.9, 1.0, 1.15, 1.3, 1.5]
+            elif freq >= 0.03:
+                # Средние классы (например, Fuzzers, DoS, Reconnaissance)
+                return [0.4, 0.7, 1.0, 1.4, 2.0, 3.2, 5.0]
+            elif freq >= 0.005:
+                # Редкие классы (например, Analysis, Backdoor, Shellcode)
+                return [0.5, 1.0, 2.0, 4.0, 8.0, 15.0, 25.0]
+            else:
+                # Экстремально редкие классы (Worms: < 0.1% выборки).
+                # Базовая вероятность часто 0.02-0.08, поэтому множитель до 45x позволяет
+                # уверенным прогнозам победить фон мажорных классов
+                return [0.5, 1.0, 2.5, 6.0, 12.0, 20.0, 32.0, 48.0]
+
+        # Оптимизируем сначала самые редкие классы, чтобы они заявили права на свои истинные примеры
+        class_order = list(np.argsort(class_freqs))
+
+        # 4 прохода координатного спуска
+        for n_pass in range(4):
             improved = False
-            for c in range(num_classes):
+            for c in class_order:
                 best_w_c = best_weights[c]
-                for mult in candidates:
+                cand_list = get_candidates_for_class(class_freqs[c])
+                for mult in cand_list:
                     test_weights = best_weights.copy()
                     test_weights[c] = mult
                     scaled_probs = oof_probs * test_weights
@@ -122,10 +146,22 @@ class ModelPortfolioAgent:
             if not improved:
                 break
 
+        # Точечная локальная подгонка (+/- 15%) вокруг оптимумов
+        for c in class_order:
+            for fine_factor in [0.85, 1.15]:
+                test_weights = best_weights.copy()
+                test_weights[c] = best_weights[c] * fine_factor
+                scaled_probs = oof_probs * test_weights
+                preds = np.argmax(scaled_probs, axis=1)
+                score = float(f1_score(y_true, preds, average="macro"))
+                if score > best_score:
+                    best_score = score
+                    best_weights[c] = test_weights[c]
+
         if verbose:
             print(
-                f"[ModelPortfolio] Оптимизация порогов: Macro F1 вырос с "
-                f"{initial_score:.4f} до {best_score:.4f}!"
+                f"[ModelPortfolio] Частотно-адаптивная оптимизация порогов: Macro F1 вырос с "
+                f"{initial_score:.4f} до {best_score:.4f} (Δ = {best_score - initial_score:+.4f})!"
             )
         return best_weights
 
@@ -356,7 +392,7 @@ class ModelPortfolioAgent:
                         learning_rate=0.06,
                         depth=6,
                         loss_function="MultiClass" if num_classes > 2 else "Logloss",
-                        auto_class_weights="Balanced",
+                        auto_class_weights="SqrtBalanced",
                         thread_count=8,
                         random_seed=42 + fold,
                         verbose=0,
@@ -403,6 +439,21 @@ class ModelPortfolioAgent:
         # ---------------------------------------------------------------------
         if self.profile.task_type == "regression":
             y_vals = y_train.values.astype(np.float32)
+            all_scores = {m: self.model_pool[m]["score"] for m in model_names}
+            best_single_score = min(all_scores.values())
+
+            # Фильтрация моделей: оставляем только те, что не более чем на 5% хуже лучшей одиночной модели
+            eligible_models = [m for m in model_names if (all_scores[m] - best_single_score) / max(best_single_score, 1e-5) <= 0.05]
+            if len(eligible_models) < len(model_names):
+                excluded = [m for m in model_names if m not in eligible_models]
+                print(f"[ModelPortfolio] Исключены отстающие модели из регрессионного блендинга: {excluded}")
+            model_names = eligible_models
+
+            if len(model_names) < 2:
+                best_m = min(all_scores, key=all_scores.get)
+                print(f"[ModelPortfolio] Только одна модель ({best_m}) прошла фильтр качества.")
+                return self.model_pool[best_m]["score"], self.model_pool[best_m]["test"], f"Single Best Model ({best_m})"
+
             y_min = self.model_pool[model_names[0]]["y_min"]
             y_max = self.model_pool[model_names[0]]["y_max"]
             oofs = [self.model_pool[m]["oof"] for m in model_names]
@@ -424,10 +475,10 @@ class ModelPortfolioAgent:
             # Дискретная сетка кандидатов для надежного старта
             candidates = []
             if len(model_names) == 2:
-                candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 21)]
+                candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 41)]
             elif len(model_names) == 3:
-                for w1 in np.linspace(0.0, 1.0, 15):
-                    for w2 in np.linspace(0.0, 1.0 - w1, 15):
+                for w1 in np.linspace(0.0, 1.0, 21):
+                    for w2 in np.linspace(0.0, 1.0 - w1, 21):
                         w3 = max(0.0, 1.0 - w1 - w2)
                         candidates.append(np.array([w1, w2, w3], dtype=np.float32))
 
@@ -466,8 +517,28 @@ class ModelPortfolioAgent:
         # 2. Ансамблирование для Классификации
         # ---------------------------------------------------------------------
         else:
+            all_scores = {m: self.model_pool[m]["score"] for m in model_names}
+            best_single_score = max(all_scores.values())
+
+            # Фильтруем модели: исключаем модели, отстающие более чем на 3% по Macro F1
+            eligible_models = [m for m in model_names if (best_single_score - all_scores[m]) <= 0.03]
+            if len(eligible_models) < len(model_names):
+                excluded = [m for m in model_names if m not in eligible_models]
+                print(f"[ModelPortfolio] Исключены отстающие модели из классификационного блендинга: {excluded}")
+            model_names = eligible_models
+
             label_enc = self.model_pool[model_names[0]]["label_enc"]
             y_encoded = label_enc.transform(y_train.astype(str))
+
+            if len(model_names) < 2:
+                best_m = max(all_scores, key=all_scores.get)
+                print(f"[ModelPortfolio] Только одна модель ({best_m}) прошла фильтр качества.")
+                m_info = self.model_pool[best_m]
+                w = self._optimize_threshold_multipliers(m_info["oof_probs"], y_encoded, verbose=False)
+                sc_test = m_info["test_probs"] * w
+                preds = label_enc.inverse_transform(np.argmax(sc_test, axis=1))
+                return m_info["score"], preds, f"Single Best Model ({best_m})"
+
             p_oofs = [self.model_pool[m]["oof_probs"] for m in model_names]
             p_tests = [self.model_pool[m]["test_probs"] for m in model_names]
 
@@ -478,11 +549,11 @@ class ModelPortfolioAgent:
             best_scaled_test = None
 
             if len(model_names) == 2:
-                candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 21)]
+                candidates = [np.array([w, 1.0 - w], dtype=np.float32) for w in np.linspace(0.0, 1.0, 41)]
             else:
                 candidates = []
-                for w1 in np.linspace(0.0, 1.0, 15):
-                    for w2 in np.linspace(0.0, 1.0 - w1, 15):
+                for w1 in np.linspace(0.0, 1.0, 21):
+                    for w2 in np.linspace(0.0, 1.0 - w1, 21):
                         w3 = max(0.0, 1.0 - w1 - w2)
                         candidates.append(np.array([w1, w2, w3], dtype=np.float32))
 
