@@ -100,8 +100,8 @@ class ModelPortfolioAgent:
         best_score = float(f1_score(y_true, baseline_preds, average="macro"))
         initial_score = best_score
 
-        # Геометрическая сетка множителей (позволяет редким классам получить буст до 60x)
-        candidates = [0.1, 0.25, 0.5, 0.75, 1.0, 1.35, 1.8, 2.5, 3.5, 5.0, 8.0, 15.0, 30.0, 60.0]
+        # Геометрическая сетка Precision-Guard: предотвращает лавинообразные ложные срабатывания (False Positives)
+        candidates = [0.25, 0.45, 0.65, 0.85, 1.0, 1.25, 1.6, 2.0, 2.8, 3.8]
 
         # 3 прохода координатного спуска
         for n_pass in range(3):
@@ -349,9 +349,11 @@ class ModelPortfolioAgent:
 
                 else:  # default catboost
                     from catboost import CatBoostClassifier
+                    cb_iters = 500 if num_classes > 2 else 900
+                    cb_early = 40 if num_classes > 2 else 70
                     model = CatBoostClassifier(
-                        iterations=1000,
-                        learning_rate=0.05,
+                        iterations=cb_iters,
+                        learning_rate=0.06,
                         depth=6,
                         loss_function="MultiClass" if num_classes > 2 else "Logloss",
                         auto_class_weights="Balanced",
@@ -359,7 +361,7 @@ class ModelPortfolioAgent:
                         random_seed=42 + fold,
                         verbose=0,
                     )
-                    model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=70, verbose=False)
+                    model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=cb_early, verbose=False)
                     val_p = model.predict_proba(X_va.fillna(-999))
                     t_p = model.predict_proba(X_test_enc.fillna(-999))
 

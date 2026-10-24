@@ -49,12 +49,18 @@ class FeatureArchitectAgent:
             dpkts = pd.to_numeric(df["dpkts"], errors="coerce").fillna(1).astype(np.float32) if "dpkts" in df.columns else 1.0
             dur = pd.to_numeric(df["dur"], errors="coerce").fillna(0.001).astype(np.float32) if "dur" in df.columns else 0.001
 
-            df["fe_byte_ratio"] = (sbytes + 1.0) / (dbytes + 1.0)
-            df["fe_pkt_ratio"] = (spkts + 1.0) / (dpkts + 1.0)
-            df["fe_sbyte_rate"] = sbytes / (dur + 0.001)
-            df["fe_dbyte_rate"] = dbytes / (dur + 0.001)
-            df["fe_spkt_mean_size"] = sbytes / (spkts + 1.0)
-            df["fe_dpkt_mean_size"] = dbytes / (dpkts + 1.0)
+            # Робастное логарифмирование для защиты от выбросов
+            log_sbytes = np.log1p(sbytes.clip(lower=0))
+            log_dbytes = np.log1p(dbytes.clip(lower=0))
+            log_spkts = np.log1p(spkts.clip(lower=0))
+            log_dpkts = np.log1p(dpkts.clip(lower=0))
+
+            df["fe_byte_ratio_log"] = log_sbytes - log_dbytes
+            df["fe_pkt_ratio_log"] = log_spkts - log_dpkts
+            df["fe_sbyte_rate_log"] = log_sbytes / (dur + 0.001)
+            df["fe_dbyte_rate_log"] = log_dbytes / (dur + 0.001)
+            df["fe_spkt_mean_size"] = log_sbytes / (spkts + 1.0)
+            df["fe_dpkt_mean_size"] = log_dbytes / (dpkts + 1.0)
 
             if "sttl" in df.columns and "dttl" in df.columns:
                 sttl = pd.to_numeric(df["sttl"], errors="coerce").fillna(0).astype(np.float32)
@@ -65,6 +71,26 @@ class FeatureArchitectAgent:
                 synack = pd.to_numeric(df["synack"], errors="coerce").fillna(0).astype(np.float32)
                 ackdat = pd.to_numeric(df["ackdat"], errors="coerce").fillna(0).astype(np.float32)
                 df["fe_tcp_setup_time"] = synack + ackdat
+
+            # Точечные признаки для сложных классов (Analysis, Backdoor, DoS)
+            if "ct_src_dport_ltm" in df.columns and "ct_dst_sport_ltm" in df.columns:
+                c1 = pd.to_numeric(df["ct_src_dport_ltm"], errors="coerce").fillna(0).astype(np.float32)
+                c2 = pd.to_numeric(df["ct_dst_sport_ltm"], errors="coerce").fillna(0).astype(np.float32)
+                df["fe_port_scan_ratio"] = (c1 + 1.0) / (c2 + 1.0)
+
+            if "ct_dst_src_ltm" in df.columns and "ct_srv_dst" in df.columns:
+                c3 = pd.to_numeric(df["ct_dst_src_ltm"], errors="coerce").fillna(0).astype(np.float32)
+                c4 = pd.to_numeric(df["ct_srv_dst"], errors="coerce").fillna(0).astype(np.float32)
+                df["fe_dst_src_ratio"] = (c3 + 1.0) / (c4 + 1.0)
+
+            if "swin" in df.columns and "dwin" in df.columns:
+                swin = pd.to_numeric(df["swin"], errors="coerce").fillna(0).astype(np.float32)
+                dwin = pd.to_numeric(df["dwin"], errors="coerce").fillna(0).astype(np.float32)
+                df["fe_win_diff"] = swin - dwin
+
+            if "rate" in df.columns:
+                rate = pd.to_numeric(df["rate"], errors="coerce").fillna(0).astype(np.float32)
+                df["fe_rate_log"] = np.log1p(rate.clip(lower=0))
 
         # Домен 2: Энергопотребление зданий (Регрессия)
         if "cooling_degree_days_c" in df.columns and "heating_degree_days_c" in df.columns:
@@ -202,7 +228,10 @@ class FeatureArchitectAgent:
 {critique_feedback if critique_feedback else "Это первая итерация. Сгенерируй 3-5 ключевых доменных признаков."}
 
 ВАЖНО: Рассуждай кратко (не более 2 предложений). Сразу выводи JSON с функцией add_features(df).
-ОБЯЗАТЕЛЬНО используй pd.to_numeric(df[col], errors='coerce') перед сложением/вычитанием/делением!
+ОБЯЗАТЕЛЬНЫЕ ПРАВИЛА:
+1. Для величин с широким диапазоном (байты, пакеты, длительность, площади) ОБЯЗАТЕЛЬНО используй np.log1p(pd.to_numeric(df[col], errors='coerce').clip(lower=0)) перед делением или вычитанием!
+2. Не предлагай тривиальные разности существующих колонок, создавай нелинейные комбинации (разности логарифмов, пороговые бинарные флаги, нормализованные интенсивности).
+3. Используй pd.to_numeric(df[col], errors='coerce') для всех числовых колонок!
 """
         import openai
 

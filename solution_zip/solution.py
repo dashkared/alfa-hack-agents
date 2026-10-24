@@ -118,20 +118,26 @@ def main(task_md_path: Path):
     feature_agent = FeatureArchitectAgent(task_dir, profile)
     model_agent = ModelPortfolioAgent(profile, n_splits=5)
 
+    # Адаптивный базовый оценщик: для многоклассовой классификации используем быстрый
+    # и точный LightGBM (предотвращает ложные откаты и ускоряет цикл в 4 раза),
+    # для регрессии — CatBoost.
+    base_model = "lightgbm" if profile.task_type == "multiclass_classification" else "catboost"
+    base_model_label = "LightGBM" if base_model == "lightgbm" else "CatBoost"
+
     print("\n" + "=" * 80)
     print("🔄 ЗАПУСК ЦИКЛА AUTORESEARCH: FEATURE & MODEL SPACE EXPLORATION")
     print("=" * 80)
 
     # -------------------------------------------------------------------------
-    # Итерация 0: Оценка чистого бейзлайна (CatBoost)
+    # Итерация 0: Оценка чистого бейзлайна
     # -------------------------------------------------------------------------
-    print("\n[Итерация 0: Baseline Model (CatBoost)]")
+    print(f"\n[Итерация 0: Baseline Model ({base_model_label})]")
     score_0, preds_0, backend_0 = model_agent.train_and_evaluate(
-        X_train_raw, y_train, X_test_raw, cat_features, model_family="catboost"
+        X_train_raw, y_train, X_test_raw, cat_features, model_family=base_model
     )
     verdict_0 = critic.evaluate_experiment(
         iteration=0,
-        hypothesis_name="Baseline Model (CatBoost)",
+        hypothesis_name=f"Baseline Model ({base_model_label})",
         current_cv_score=score_0,
         test_predictions=preds_0,
         test_ids=test_ids,
@@ -154,7 +160,7 @@ def main(task_md_path: Path):
             best_X_train, best_X_test, best_cat_cols
         )
         score_univ, preds_univ, _ = model_agent.train_and_evaluate(
-            X_tr_univ, y_train, X_te_univ, cats_univ, model_family="catboost"
+            X_tr_univ, y_train, X_te_univ, cats_univ, model_family=base_model
         )
         verdict_univ = critic.evaluate_experiment(
             iteration=current_iter,
@@ -207,9 +213,9 @@ def main(task_md_path: Path):
             X_test_cand = optimize_dtypes(X_test_cand[common_cols])
             cand_cats = [c for c in best_cat_cols if c in common_cols]
 
-            print(f"  -> Обучение CatBoost на кандидате признаков (Всего колонок: {len(common_cols)})...")
+            print(f"  -> Обучение {base_model_label} на кандидате признаков (Всего колонок: {len(common_cols)})...")
             score_i, preds_i, backend_i = model_agent.train_and_evaluate(
-                X_train_cand, y_train, X_test_cand, cand_cats, model_family="catboost"
+                X_train_cand, y_train, X_test_cand, cand_cats, model_family=base_model
             )
 
             verdict_i = critic.evaluate_experiment(
@@ -248,7 +254,7 @@ def main(task_md_path: Path):
         )
         if dropped:
             score_pruned, preds_pruned, _ = model_agent.train_and_evaluate(
-                pruned_X_tr, y_train, pruned_X_te, pruned_cats, model_family="catboost"
+                pruned_X_tr, y_train, pruned_X_te, pruned_cats, model_family=base_model
             )
             verdict_pruned = critic.evaluate_experiment(
                 iteration=current_iter,
@@ -269,50 +275,36 @@ def main(task_md_path: Path):
 
     # Сбрасываем пул моделей перед обучением разнородных архитектур на лучшем наборе признаков
     model_agent.clear_pool()
-    # Регистрируем CatBoost на лучшем наборе
-    print(f"\n[ModelPortfolio] Фиксация базовой модели CatBoost на лучшем пространстве признаков...")
+    # Регистрируем базовую модель на лучшем пространстве признаков
+    print(f"\n[ModelPortfolio] Фиксация базовой модели {base_model_label} на лучшем пространстве признаков...")
     model_agent.train_and_evaluate(
-        best_X_train, y_train, best_X_test, best_cat_cols, model_family="catboost"
+        best_X_train, y_train, best_X_test, best_cat_cols, model_family=base_model
     )
 
     # -------------------------------------------------------------------------
-    # ФАЗА 4: Исследование пространства моделей (Big-3 Portfolio: LightGBM & XGBoost)
+    # ФАЗА 4: Исследование пространства моделей («Большая тройка»: CatBoost, LightGBM, XGBoost)
     # -------------------------------------------------------------------------
-    print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: LightGBM)]")
-    try:
-        score_lgb, preds_lgb, backend_lgb = model_agent.train_and_evaluate(
-            best_X_train, y_train, best_X_test, best_cat_cols, model_family="lightgbm"
-        )
-        verdict_lgb = critic.evaluate_experiment(
-            iteration=current_iter,
-            hypothesis_name="Model Diversity: LightGBM",
-            current_cv_score=score_lgb,
-            test_predictions=preds_lgb,
-            test_ids=test_ids,
-        )
-        print(f"  -> Вердикт Монитора: [{verdict_lgb.status}] | CV {profile.metric}: {verdict_lgb.current_cv_score:.4f} (Δ = {verdict_lgb.delta:+.4f})")
-    except Exception as e:
-        print(f"  ⚠️ Ошибка обучения LightGBM: {e}")
+    other_models = ["xgboost", "catboost"] if base_model == "lightgbm" else ["lightgbm", "xgboost"]
 
-    current_iter += 1
+    for m_fam in other_models:
+        fam_label = "LightGBM" if m_fam == "lightgbm" else ("XGBoost" if m_fam == "xgboost" else "CatBoost")
+        print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: {fam_label})]")
+        try:
+            score_m, preds_m, backend_m = model_agent.train_and_evaluate(
+                best_X_train, y_train, best_X_test, best_cat_cols, model_family=m_fam
+            )
+            verdict_m = critic.evaluate_experiment(
+                iteration=current_iter,
+                hypothesis_name=f"Model Diversity: {fam_label}",
+                current_cv_score=score_m,
+                test_predictions=preds_m,
+                test_ids=test_ids,
+            )
+            print(f"  -> Вердикт Монитора: [{verdict_m.status}] | CV {profile.metric}: {verdict_m.current_cv_score:.4f} (Δ = {verdict_m.delta:+.4f})")
+        except Exception as e:
+            print(f"  ⚠️ Ошибка обучения {fam_label}: {e}")
 
-    print(f"\n[Итерация {current_iter}: ModelPortfolio Agent (Архитектура: XGBoost)]")
-    try:
-        score_xgb, preds_xgb, backend_xgb = model_agent.train_and_evaluate(
-            best_X_train, y_train, best_X_test, best_cat_cols, model_family="xgboost"
-        )
-        verdict_xgb = critic.evaluate_experiment(
-            iteration=current_iter,
-            hypothesis_name="Model Diversity: XGBoost",
-            current_cv_score=score_xgb,
-            test_predictions=preds_xgb,
-            test_ids=test_ids,
-        )
-        print(f"  -> Вердикт Монитора: [{verdict_xgb.status}] | CV {profile.metric}: {verdict_xgb.current_cv_score:.4f} (Δ = {verdict_xgb.delta:+.4f})")
-    except Exception as e:
-        print(f"  ⚠️ Ошибка обучения XGBoost: {e}")
-
-    current_iter += 1
+        current_iter += 1
 
     # -------------------------------------------------------------------------
     # ФАЗА 5: Ансамблирование (Ensembling / Blending Agent)
