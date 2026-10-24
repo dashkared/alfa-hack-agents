@@ -29,6 +29,10 @@ class TaskProfile(BaseModel):
         default="tabular",
         description="Модальность входных данных (tabular)"
     )
+    time_column: Optional[str] = Field(
+        default=None,
+        description="Название колонки с временной меткой или датой (если применимо)"
+    )
     description_summary: Optional[str] = Field(
         default="",
         description="Краткая формулировка физического/бизнес-смысла задачи"

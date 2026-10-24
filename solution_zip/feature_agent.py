@@ -226,7 +226,29 @@ class FeatureArchitectAgent:
             except Exception:
                 pass
 
-        # 6. Доменные эвристики для известных модальностей
+        # 6. Попарные категориальные кроссы (2-Way Categorical Crosses + Frequency)
+        if len(active_cats) >= 2:
+            for i in range(min(len(active_cats), 3)):
+                for j in range(i + 1, min(len(active_cats), 3)):
+                    c1, c2 = active_cats[i], active_cats[j]
+                    try:
+                        if X_tr[c1].nunique() <= 70 and X_tr[c2].nunique() <= 70:
+                            cross_col = f"fe_{c1}_x_{c2}"
+                            tr_cross = X_tr[c1].astype(str) + "_" + X_tr[c2].astype(str)
+                            te_cross = X_te[c1].astype(str) + "_" + X_te[c2].astype(str)
+                            X_tr[cross_col] = tr_cross
+                            X_te[cross_col] = te_cross
+                            if cross_col not in new_cats:
+                                new_cats.append(cross_col)
+
+                            # Совместная частота кросс-категории
+                            cr_freq = tr_cross.value_counts(normalize=True)
+                            X_tr[f"{cross_col}_freq"] = tr_cross.map(cr_freq).fillna(0.0).astype(np.float32)
+                            X_te[f"{cross_col}_freq"] = te_cross.map(cr_freq).fillna(0.0).astype(np.float32)
+                    except Exception:
+                        pass
+
+        # 7. Доменные эвристики для известных модальностей
         X_tr = self._apply_domain_fallback_features(X_tr)
         X_te = self._apply_domain_fallback_features(X_te)
 

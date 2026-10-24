@@ -141,6 +141,7 @@ def main(task_md_path: Path):
         current_cv_score=score_0,
         test_predictions=preds_0,
         test_ids=test_ids,
+        fold_scores=model_agent.last_fold_scores,
     )
     print(f"  -> Вердикт Монитора: [{verdict_0.status}] | CV {profile.metric}: {verdict_0.current_cv_score:.4f}")
 
@@ -168,6 +169,7 @@ def main(task_md_path: Path):
             current_cv_score=score_univ,
             test_predictions=preds_univ,
             test_ids=test_ids,
+            fold_scores=model_agent.last_fold_scores,
         )
         print(f"  -> Вердикт Монитора: [{verdict_univ.status}] | CV {profile.metric}: {verdict_univ.current_cv_score:.4f} (Δ = {verdict_univ.delta:+.4f})")
         print(f"  -> {verdict_univ.critique_for_agents}")
@@ -224,6 +226,7 @@ def main(task_md_path: Path):
                 current_cv_score=score_i,
                 test_predictions=preds_i,
                 test_ids=test_ids,
+                fold_scores=model_agent.last_fold_scores,
             )
 
             print(f"  -> Вердикт Монитора: [{verdict_i.status}] | CV {profile.metric}: {verdict_i.current_cv_score:.4f} (Δ = {verdict_i.delta:+.4f})")
@@ -262,6 +265,7 @@ def main(task_md_path: Path):
                 current_cv_score=score_pruned,
                 test_predictions=preds_pruned,
                 test_ids=test_ids,
+                fold_scores=model_agent.last_fold_scores,
             )
             print(f"  -> Вердикт Монитора: [{verdict_pruned.status}] | CV {profile.metric}: {verdict_pruned.current_cv_score:.4f} (Δ = {verdict_pruned.delta:+.4f})")
             if verdict_pruned.status == "PASS" or verdict_pruned.is_improvement:
@@ -293,6 +297,7 @@ def main(task_md_path: Path):
                 current_cv_score=score_base,
                 test_predictions=preds_base,
                 test_ids=test_ids,
+                fold_scores=model_agent.last_fold_scores,
             )
             print(f"  -> Вердикт Монитора: [{verdict_base.status}] | CV {profile.metric}: {verdict_base.current_cv_score:.4f} (Δ = {verdict_base.delta:+.4f})")
             current_iter += 1
@@ -322,6 +327,7 @@ def main(task_md_path: Path):
                 current_cv_score=score_m,
                 test_predictions=preds_m,
                 test_ids=test_ids,
+                fold_scores=model_agent.last_fold_scores,
             )
             print(f"  -> Вердикт Монитора: [{verdict_m.status}] | CV {profile.metric}: {verdict_m.current_cv_score:.4f} (Δ = {verdict_m.delta:+.4f})")
         except Exception as e:
@@ -344,6 +350,7 @@ def main(task_md_path: Path):
                 current_cv_score=score_blend,
                 test_predictions=preds_blend,
                 test_ids=test_ids,
+                fold_scores=model_agent.last_fold_scores,
             )
             print(f"  -> Вердикт Монитора: [{verdict_blend.status}] | CV {profile.metric}: {verdict_blend.current_cv_score:.4f} (Δ = {verdict_blend.delta:+.4f})")
             if verdict_blend.status == "PASS":

@@ -4,6 +4,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 from prompts import TaskProfile
+from sklearn.ensemble import HistGradientBoostingClassifier, HistGradientBoostingRegressor
+from sklearn.linear_model import LogisticRegression, RidgeCV
 from sklearn.metrics import f1_score, mean_squared_error
 from sklearn.model_selection import KFold, StratifiedKFold
 from sklearn.preprocessing import LabelEncoder
@@ -16,7 +18,7 @@ class ModelPortfolioAgent:
 
     Управляет портфелем моделей «Большой тройки» (CatBoost, LightGBM, XGBoost),
     выполняет очистку неинформативных признаков (Feature Pruning),
-    оптимизирует многомерные пороги для редких классов и строит оптимальные ансамбли (OOF Blending).
+    оптимизирует многомерные пороги для редких классов и строит оптимальные ансамбли (OOF Blending и Multi-Layer Stacking).
     """
 
     def __init__(self, profile: TaskProfile, n_splits: int = 5):
@@ -24,6 +26,10 @@ class ModelPortfolioAgent:
         self.n_splits = n_splits
         # Пул обученных моделей на текущем лучшем признаковом пространстве
         self.model_pool: Dict[str, Dict[str, Any]] = {}
+        # Зафиксированные разбиения фолдов для точного согласования OOF и парных тестов
+        self.fold_indices: Optional[List[Tuple[np.ndarray, np.ndarray]]] = None
+        # Пофолдовые скоры последней обученной модели (для Critic Monitor)
+        self.last_fold_scores: Optional[List[float]] = None
 
     def clear_pool(self):
         """Сброс пула моделей (вызывается при изменении признакового пространства)."""
@@ -205,9 +211,14 @@ class ModelPortfolioAgent:
                 if c in X_train.columns and 2 <= X_train[c].nunique() <= 120
             ][:4]
 
-            kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=42)
+            if self.fold_indices is None or len(self.fold_indices[0][0]) + len(self.fold_indices[0][1]) != len(y_vals):
+                kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=42)
+                self.fold_indices = list(kf.split(X_train_enc, y_vals))
 
-            for fold, (train_idx, val_idx) in enumerate(kf.split(X_train_enc, y_vals)):
+            fold_scores = []
+            early_stopped = False
+
+            for fold, (train_idx, val_idx) in enumerate(self.fold_indices):
                 X_tr = X_train_enc.iloc[train_idx].copy()
                 y_tr = y_vals[train_idx]
                 X_va = X_train_enc.iloc[val_idx].copy()
@@ -338,17 +349,43 @@ class ModelPortfolioAgent:
                 oof_preds[val_idx] = val_p
                 test_preds += t_p / self.n_splits
 
+                # Вычисляем пофолдовый скор
+                fold_rmse = float(np.sqrt(mean_squared_error(y_va, np.clip(val_p, y_min, y_max))))
+                fold_scores.append(fold_rmse)
+
+                # Multi-Fidelity Screening: проверка после 2 фолдов (PIPELINE.md §9)
+                if fold == 1 and len(self.model_pool) > 0:
+                    cand_2f = float(np.mean(fold_scores[:2]))
+                    best_base = min(self.model_pool.values(), key=lambda m: m["score"])
+                    if "fold_scores" in best_base and len(best_base["fold_scores"]) >= 2:
+                        base_2f = float(np.mean(best_base["fold_scores"][:2]))
+                        lag = (cand_2f - base_2f) / max(base_2f, 1e-5)
+                        if lag > 0.08:
+                            print(f"  ⚡ [Multi-Fidelity] {model_family} отстает на {lag*100:.1f}% после 2 фолдов. Ранняя остановка для экономии ресурсов.")
+                            early_stopped = True
+                            break
+
+            if early_stopped:
+                self.last_fold_scores = fold_scores
+                return 999.0, test_preds, backend_name
+
             # Физический пост-процессинг: ограничение допустимых границ таргета
             oof_preds = np.clip(oof_preds, y_min, y_max)
             test_preds = np.clip(test_preds, y_min, y_max)
 
             oof_score = float(np.sqrt(mean_squared_error(y_vals, oof_preds)))
+            fold_scores = [
+                float(np.sqrt(mean_squared_error(y_vals[va_idx], oof_preds[va_idx])))
+                for tr_idx, va_idx in self.fold_indices
+            ]
+            self.last_fold_scores = fold_scores
 
             # Сохраняем в пул для последующего ансамблирования
             self.model_pool[model_family] = {
                 "oof": oof_preds,
                 "test": test_preds,
                 "score": oof_score,
+                "fold_scores": fold_scores,
                 "name": model_family,
                 "y_min": y_min,
                 "y_max": y_max,
@@ -381,9 +418,14 @@ class ModelPortfolioAgent:
                 if c in X_train.columns and 2 <= X_train[c].nunique() <= 150
             ][:3]
 
-            skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
+            if self.fold_indices is None or len(self.fold_indices[0][0]) + len(self.fold_indices[0][1]) != len(y_encoded):
+                skf = StratifiedKFold(n_splits=self.n_splits, shuffle=True, random_state=42)
+                self.fold_indices = list(skf.split(X_train_enc, y_encoded))
 
-            for fold, (train_idx, val_idx) in enumerate(skf.split(X_train_enc, y_encoded)):
+            fold_scores = []
+            early_stopped = False
+
+            for fold, (train_idx, val_idx) in enumerate(self.fold_indices):
                 X_tr = X_train_enc.iloc[train_idx].copy()
                 y_tr = y_encoded[train_idx]
                 X_va = X_train_enc.iloc[val_idx].copy()
@@ -521,6 +563,25 @@ class ModelPortfolioAgent:
                 oof_probs[val_idx] = val_p
                 test_probs += t_p / self.n_splits
 
+                fold_f1 = float(f1_score(y_va, np.argmax(val_p, axis=1), average="macro"))
+                fold_scores.append(fold_f1)
+
+                # Multi-Fidelity Screening: проверка после 2 фолдов (PIPELINE.md §9)
+                if fold == 1 and len(self.model_pool) > 0:
+                    cand_2f = float(np.mean(fold_scores[:2]))
+                    best_base = max(self.model_pool.values(), key=lambda m: m["score"])
+                    if "fold_scores" in best_base and len(best_base["fold_scores"]) >= 2:
+                        base_2f = float(np.mean(best_base["fold_scores"][:2]))
+                        lag = base_2f - cand_2f
+                        if lag > 0.040:
+                            print(f"  ⚡ [Multi-Fidelity] {model_family} отстает на {lag:.4f} F1 после 2 фолдов. Ранняя остановка для экономии ресурсов.")
+                            early_stopped = True
+                            break
+
+            if early_stopped:
+                self.last_fold_scores = fold_scores
+                return 0.0, label_enc.inverse_transform(np.argmax(test_probs, axis=1)), backend_name
+
             # Тюнинг порогов вероятностей для редких классов
             class_weights = self._optimize_threshold_multipliers(oof_probs, y_encoded)
             scaled_oof_probs = oof_probs * class_weights
@@ -532,11 +593,18 @@ class ModelPortfolioAgent:
             final_test_preds = label_enc.inverse_transform(test_pred_labels)
             oof_score = float(f1_score(y_encoded, oof_pred_labels, average="macro"))
 
+            fold_scores = [
+                float(f1_score(y_encoded[va_idx], oof_pred_labels[va_idx], average="macro"))
+                for tr_idx, va_idx in self.fold_indices
+            ]
+            self.last_fold_scores = fold_scores
+
             # Сохраняем в пул для ансамблирования
             self.model_pool[model_family] = {
                 "oof_probs": oof_probs,
                 "test_probs": test_probs,
                 "score": oof_score,
+                "fold_scores": fold_scores,
                 "name": model_family,
                 "label_enc": label_enc,
             }
@@ -569,6 +637,7 @@ class ModelPortfolioAgent:
             if len(model_names) < 2:
                 best_m = min(all_scores, key=all_scores.get)
                 print(f"[ModelPortfolio] Только одна модель ({best_m}) прошла фильтр качества.")
+                self.last_fold_scores = self.model_pool[best_m].get("fold_scores", None)
                 return self.model_pool[best_m]["score"], self.model_pool[best_m]["test"], f"Single Best Model ({best_m})"
 
             y_min = self.model_pool[model_names[0]]["y_min"]
@@ -627,18 +696,83 @@ class ModelPortfolioAgent:
             except Exception:
                 pass
 
-            # Финальный взвешенный предикт
+            # Финальный взвешенный предикт линейного блендинга
             blend_test = np.zeros_like(tests[0])
+            blend_oof = np.zeros_like(y_vals)
             active_components = []
-            for m_name, weight, t_pred in zip(model_names, best_weights, tests):
+            for m_name, weight, t_pred, oof in zip(model_names, best_weights, tests, oofs):
                 if weight > 0.01:
                     blend_test += float(weight) * t_pred
+                    blend_oof += float(weight) * oof
                     active_components.append(f"{weight:.2f}*{m_name}")
             blend_test = np.clip(blend_test, y_min, y_max)
+            blend_oof = np.clip(blend_oof, y_min, y_max)
+            linear_name = f"Ensemble Blend ({' + '.join(active_components)})"
+            best_linear_rmse = float(np.sqrt(mean_squared_error(y_vals, blend_oof)))
 
-            name = f"Ensemble Blend ({' + '.join(active_components)})"
-            print(f"[ModelPortfolio] Оптимальный ансамбль: {name} -> CV RMSE: {best_rmse:.4f}")
-            return best_rmse, blend_test, name
+            # -----------------------------------------------------------------
+            # 2. Multi-Layer Stacking Meta-Learner (RidgeCV & HistGBM)
+            # -----------------------------------------------------------------
+            print(f"[ModelPortfolio] Оценка Stacking Meta-Learner на OOF предсказаниях...")
+            S_train = np.column_stack([self.model_pool[m]["oof"] for m in model_names])
+            S_test = np.column_stack([self.model_pool[m]["test"] for m in model_names])
+
+            # Meta-Model 1: RidgeCV
+            stack_oof_ridge = np.zeros(len(y_vals), dtype=np.float32)
+            try:
+                for tr_idx, va_idx in self.fold_indices:
+                    m_reg = RidgeCV(alphas=np.logspace(-3, 3, 25))
+                    m_reg.fit(S_train[tr_idx], y_vals[tr_idx])
+                    stack_oof_ridge[va_idx] = m_reg.predict(S_train[va_idx])
+                stack_oof_ridge = np.clip(stack_oof_ridge, y_min, y_max)
+                stack_rmse_ridge = float(np.sqrt(mean_squared_error(y_vals, stack_oof_ridge)))
+
+                meta_ridge_full = RidgeCV(alphas=np.logspace(-3, 3, 25))
+                meta_ridge_full.fit(S_train, y_vals)
+                stack_test_ridge = np.clip(meta_ridge_full.predict(S_test), y_min, y_max)
+            except Exception as e:
+                stack_rmse_ridge = 999.0
+                stack_test_ridge = blend_test
+
+            # Meta-Model 2: Shallow HistGBM
+            stack_oof_hgb = np.zeros(len(y_vals), dtype=np.float32)
+            try:
+                for fold, (tr_idx, va_idx) in enumerate(self.fold_indices):
+                    m_hgb = HistGradientBoostingRegressor(
+                        max_depth=3, max_iter=60, learning_rate=0.04, l2_regularization=2.0, random_state=42 + fold
+                    )
+                    m_hgb.fit(S_train[tr_idx], y_vals[tr_idx])
+                    stack_oof_hgb[va_idx] = m_hgb.predict(S_train[va_idx])
+                stack_oof_hgb = np.clip(stack_oof_hgb, y_min, y_max)
+                stack_rmse_hgb = float(np.sqrt(mean_squared_error(y_vals, stack_oof_hgb)))
+
+                meta_hgb_full = HistGradientBoostingRegressor(
+                    max_depth=3, max_iter=60, learning_rate=0.04, l2_regularization=2.0, random_state=42
+                )
+                meta_hgb_full.fit(S_train, y_vals)
+                stack_test_hgb = np.clip(meta_hgb_full.predict(S_test), y_min, y_max)
+            except Exception as e:
+                stack_rmse_hgb = 999.0
+                stack_test_hgb = blend_test
+
+            # Выбор сильнейшей стратегии ансамблирования
+            options = [
+                (best_linear_rmse, blend_test, blend_oof, linear_name),
+                (stack_rmse_ridge, stack_test_ridge, stack_oof_ridge, f"Stacking Meta-Learner (RidgeCV: {' + '.join(model_names)})"),
+                (stack_rmse_hgb, stack_test_hgb, stack_oof_hgb, f"Stacking Meta-Learner (HistGBM: {' + '.join(model_names)})"),
+            ]
+            options.sort(key=lambda x: x[0])
+            winner_score, winner_test, winner_oof, winner_name = options[0]
+
+            winner_fold_scores = [
+                float(np.sqrt(mean_squared_error(y_vals[va_idx], winner_oof[va_idx])))
+                for tr_idx, va_idx in self.fold_indices
+            ]
+            self.last_fold_scores = winner_fold_scores
+
+            print(f"[ModelPortfolio] Оптимальный ансамбль: {winner_name} -> CV RMSE: {winner_score:.4f} "
+                  f"(Linear: {best_linear_rmse:.4f}, RidgeCV: {stack_rmse_ridge:.4f}, HistGBM: {stack_rmse_hgb:.4f})")
+            return winner_score, winner_test, winner_name
 
         # ---------------------------------------------------------------------
         # 2. Ансамблирование для Классификации
@@ -664,6 +798,7 @@ class ModelPortfolioAgent:
                 w = self._optimize_threshold_multipliers(m_info["oof_probs"], y_encoded, verbose=False)
                 sc_test = m_info["test_probs"] * w
                 preds = label_enc.inverse_transform(np.argmax(sc_test, axis=1))
+                self.last_fold_scores = m_info.get("fold_scores", None)
                 return m_info["score"], preds, f"Single Best Model ({best_m})"
 
             p_oofs = [self.model_pool[m]["oof_probs"] for m in model_names]
@@ -700,6 +835,7 @@ class ModelPortfolioAgent:
                             if rem >= 0:
                                 candidates.append(np.array([w1, w2, w3, rem], dtype=np.float32))
 
+            best_preds_linear_oof = None
             for cand_w in candidates:
                 blend_p_oof = np.zeros_like(p_oofs[0])
                 blend_p_test = np.zeros_like(p_tests[0])
@@ -716,6 +852,12 @@ class ModelPortfolioAgent:
                     best_f1 = score
                     best_weights = cand_w
                     best_scaled_test = blend_p_test * weights
+                    best_preds_linear_oof = preds_oof
+
+            if best_preds_linear_oof is None:
+                m_single = self.model_pool[model_names[best_single_idx]]
+                w_s = self._optimize_threshold_multipliers(m_single["oof_probs"], y_encoded, verbose=False)
+                best_preds_linear_oof = np.argmax(m_single["oof_probs"] * w_s, axis=1)
 
             active_components = []
             final_p_test = np.zeros_like(p_tests[0])
@@ -729,6 +871,57 @@ class ModelPortfolioAgent:
             else:
                 final_test_preds = label_enc.inverse_transform(np.argmax(final_p_test, axis=1))
 
-            name = f"Ensemble Blend ({' + '.join(active_components)})"
-            print(f"[ModelPortfolio] Оптимальный ансамбль: {name} -> CV Macro F1: {best_f1:.4f}")
-            return best_f1, final_test_preds, name
+            linear_name = f"Ensemble Blend ({' + '.join(active_components)})"
+            best_linear_f1 = best_f1
+
+            # -----------------------------------------------------------------
+            # 2. Multi-Layer Stacking Meta-Learner (LogisticRegression)
+            # -----------------------------------------------------------------
+            print(f"[ModelPortfolio] Оценка Stacking Meta-Learner на OOF вероятностях...")
+            stack_f1 = -1.0
+            stack_test_preds = None
+            preds_stack_oof = None
+            try:
+                num_classes = len(label_enc.classes_)
+                S_train = np.hstack([self.model_pool[m]["oof_probs"] for m in model_names])
+                S_test = np.hstack([self.model_pool[m]["test_probs"] for m in model_names])
+
+                stack_oof_probs = np.zeros((len(y_encoded), num_classes), dtype=np.float32)
+                for tr_idx, va_idx in self.fold_indices:
+                    lr = LogisticRegression(C=0.5, max_iter=300, solver="lbfgs")
+                    lr.fit(S_train[tr_idx], y_encoded[tr_idx])
+                    stack_oof_probs[va_idx] = lr.predict_proba(S_train[va_idx])
+
+                w_stack = self._optimize_threshold_multipliers(stack_oof_probs, y_encoded, verbose=False)
+                scaled_stack_oof = stack_oof_probs * w_stack
+                preds_stack_oof = np.argmax(scaled_stack_oof, axis=1)
+                stack_f1 = float(f1_score(y_encoded, preds_stack_oof, average="macro"))
+
+                lr_full = LogisticRegression(C=0.5, max_iter=300, solver="lbfgs")
+                lr_full.fit(S_train, y_encoded)
+                stack_test_probs = lr_full.predict_proba(S_test)
+                scaled_stack_test = stack_test_probs * w_stack
+                stack_test_preds = label_enc.inverse_transform(np.argmax(scaled_stack_test, axis=1))
+            except Exception as e:
+                print(f"[ModelPortfolio] Исключение в Stacking: {e}")
+
+            if stack_f1 > best_linear_f1:
+                winner_score = stack_f1
+                winner_test = stack_test_preds
+                winner_oof_preds = preds_stack_oof
+                winner_name = f"Stacking Meta-Learner (LogisticRegression: {' + '.join(model_names)})"
+            else:
+                winner_score = best_linear_f1
+                winner_test = final_test_preds
+                winner_oof_preds = best_preds_linear_oof
+                winner_name = linear_name
+
+            winner_fold_scores = [
+                float(f1_score(y_encoded[va_idx], winner_oof_preds[va_idx], average="macro"))
+                for tr_idx, va_idx in self.fold_indices
+            ]
+            self.last_fold_scores = winner_fold_scores
+
+            print(f"[ModelPortfolio] Оптимальный ансамбль: {winner_name} -> CV Macro F1: {winner_score:.4f} "
+                  f"(Linear: {best_linear_f1:.4f}, Stacking: {stack_f1:.4f})")
+            return winner_score, winner_test, winner_name
