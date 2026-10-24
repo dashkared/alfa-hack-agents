@@ -297,7 +297,7 @@ def main(task_md_path: Path):
             print(f"  -> Вердикт Монитора: [{verdict_base.status}] | CV {profile.metric}: {verdict_base.current_cv_score:.4f} (Δ = {verdict_base.delta:+.4f})")
             current_iter += 1
     if profile.task_type == "regression":
-        other_models = ["lightgbm", "xgboost", "lightgbm_huber"]
+        other_models = ["lightgbm", "xgboost", "xgboost_reg_l2"]
     else:
         other_models = ["xgboost", "catboost", "xgboost_deep"]
 
@@ -305,7 +305,7 @@ def main(task_md_path: Path):
         "lightgbm": "LightGBM",
         "xgboost": "XGBoost",
         "catboost": "CatBoost",
-        "lightgbm_huber": "LightGBM (Huber Loss)",
+        "xgboost_reg_l2": "XGBoost (L2 Regularized)",
         "xgboost_deep": "XGBoost (Deep Architecture)",
     }
 

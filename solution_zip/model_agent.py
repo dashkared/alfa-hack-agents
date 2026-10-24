@@ -258,32 +258,28 @@ class ModelPortfolioAgent:
                         val_p = model.predict(X_va.fillna(-999))
                         t_p = model.predict(X_te.fillna(-999))
 
-                elif model_family == "lightgbm_huber":
-                    # Робастная к тяжелым хвостам и выбросам модель с функцией потерь Huber
+                elif model_family == "xgboost_reg_l2":
+                    # Регуляризованная модель XGBoost (L2 reg + feature subsampling 0.65)
                     try:
-                        import lightgbm as lgb
-                        model = lgb.LGBMRegressor(
-                            objective="huber",
-                            alpha=0.9,
+                        import xgboost as xgb
+                        model = xgb.XGBRegressor(
                             n_estimators=1000,
-                            learning_rate=0.04,
-                            num_leaves=45,
+                            learning_rate=0.035,
+                            max_depth=7,
+                            reg_lambda=5.0,
                             subsample=0.8,
-                            colsample_bytree=0.8,
+                            colsample_bytree=0.65,
+                            tree_method="hist",
                             random_state=42 + fold,
-                            verbose=-1,
                             n_jobs=8,
+                            early_stopping_rounds=70,
                         )
-                        model.fit(
-                            X_tr, y_tr,
-                            eval_set=[(X_va, y_va)],
-                            callbacks=[lgb.early_stopping(stopping_rounds=70, verbose=False)],
-                        )
+                        model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)], verbose=False)
                         val_p = model.predict(X_va)
                         t_p = model.predict(X_te)
                     except Exception:
                         from sklearn.ensemble import HistGradientBoostingRegressor
-                        model = HistGradientBoostingRegressor(loss="absolute_error", max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
+                        model = HistGradientBoostingRegressor(max_iter=350, learning_rate=0.06, max_depth=8, random_state=42 + fold)
                         model.fit(X_tr.fillna(-999), y_tr)
                         val_p = model.predict(X_va.fillna(-999))
                         t_p = model.predict(X_te.fillna(-999))
@@ -651,8 +647,8 @@ class ModelPortfolioAgent:
             all_scores = {m: self.model_pool[m]["score"] for m in model_names}
             best_single_score = max(all_scores.values())
 
-            # Фильтруем модели: исключаем модели, отстающие более чем на 3% по Macro F1
-            eligible_models = [m for m in model_names if (best_single_score - all_scores[m]) <= 0.03]
+            # Фильтруем модели: исключаем модели, отстающие более чем на 1.5% по Macro F1
+            eligible_models = [m for m in model_names if (best_single_score - all_scores[m]) <= 0.015]
             if len(eligible_models) < len(model_names):
                 excluded = [m for m in model_names if m not in eligible_models]
                 print(f"[ModelPortfolio] Исключены отстающие модели из классификационного блендинга: {excluded}")
