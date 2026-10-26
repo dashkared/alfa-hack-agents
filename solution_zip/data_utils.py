@@ -1,159 +1,267 @@
+"""Data IO, dtype compression and bullet-proof submission writing.
+
+Design rules (learned the hard way):
+  * never rely on pandas-3-only behaviour; the evaluation container runs pandas 2.2;
+  * object columns are kept as `object` (never silently cast to `category`), because
+    downstream `.map(dict)` / `.fillna()` chains behave differently for Categorical;
+  * numeric downcasting is done column-wise with numpy bounds checks;
+  * `submission.csv` is written atomically and validated against `sample_submission.csv`.
+"""
 import os
 from pathlib import Path
-from typing import List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from prompts import TaskProfile
+
+FORBIDDEN_TARGET_NAMES = {"id", "index"}
 
 
-def optimize_dtypes(df: pd.DataFrame) -> pd.DataFrame:
-    """Оптимизация типов данных (downcasting) для экономии RAM и ускорения на CPU."""
+# --------------------------------------------------------------------------- #
+# File discovery
+# --------------------------------------------------------------------------- #
+def locate_file(task_dir: Path, filename: str, required: bool = True) -> Optional[Path]:
+    """Find `filename` in the task directory (or one level of sub-directories)."""
+    task_dir = Path(task_dir).resolve()
+    direct = task_dir / filename
+    if direct.is_file():
+        return direct
+    # nested layout, e.g. task.md references `regression/participants/train.csv`
+    if task_dir.is_dir():
+        matches = sorted(task_dir.rglob(filename))
+        if matches:
+            return matches[0]
+    cwd = Path.cwd().resolve()
+    if (cwd / filename).is_file():
+        return cwd / filename
+    if required:
+        raise FileNotFoundError(f"Не найден обязательный файл '{filename}' в {task_dir}")
+    return None
+
+
+def read_csv_safe(path: Path, **kwargs) -> pd.DataFrame:
+    """Read a CSV with a couple of fallbacks for odd encodings/separators."""
+    path = Path(path)
+    attempts = [
+        dict(sep=",", encoding="utf-8"),
+        dict(sep=",", encoding="utf-8-sig"),
+        dict(sep=";", encoding="utf-8"),
+        dict(sep=None, engine="python", encoding="utf-8"),
+        dict(sep=",", encoding="latin-1"),
+    ]
+    last_err = None
+    for kw in attempts:
+        try:
+            df = pd.read_csv(path, low_memory=False, **{**kw, **kwargs})
+            if df.shape[1] >= 1 and len(df) > 0:
+                return df
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+    if last_err is not None:
+        raise last_err
+    return pd.read_csv(path, **kwargs)
+
+
+# --------------------------------------------------------------------------- #
+# dtype compression (platform requirement: downcasting on step 1)
+# --------------------------------------------------------------------------- #
+def optimize_dtypes(df: pd.DataFrame, verbose: bool = False) -> pd.DataFrame:
+    """Downcast numeric columns.  Object columns are intentionally left untouched."""
+    if df.empty:
+        return df
+    start_mb = df.memory_usage(deep=True).sum() / 1e6
     for col in df.columns:
-        col_type = df[col].dtype
-
-        if pd.api.types.is_integer_dtype(col_type):
-            c_min = df[col].min()
-            c_max = df[col].max()
-            if c_min >= np.iinfo(np.int8).min and c_max <= np.iinfo(np.int8).max:
+        dt = df[col].dtype
+        try:
+            if pd.api.types.is_integer_dtype(dt):
+                c_min, c_max = df[col].min(), df[col].max()
+                if pd.isna(c_min) or pd.isna(c_max):
+                    continue
+                for typ in (np.int8, np.int16, np.int32):
+                    if c_min >= np.iinfo(typ).min and c_max <= np.iinfo(typ).max:
+                        df[col] = df[col].astype(typ)
+                        break
+                else:
+                    df[col] = df[col].astype(np.int64)
+            elif pd.api.types.is_float_dtype(dt):
+                if dt != np.float32:
+                    df[col] = df[col].astype(np.float32)
+            elif pd.api.types.is_bool_dtype(dt):
                 df[col] = df[col].astype(np.int8)
-            elif c_min >= np.iinfo(np.int16).min and c_max <= np.iinfo(np.int16).max:
-                df[col] = df[col].astype(np.int16)
-            elif c_min >= np.iinfo(np.int32).min and c_max <= np.iinfo(np.int32).max:
-                df[col] = df[col].astype(np.int32)
-            else:
-                df[col] = df[col].astype(np.int64)
-
-        elif pd.api.types.is_float_dtype(col_type):
-            df[col] = df[col].astype(np.float32)
-
-        elif col_type == object:
-            num_unique = df[col].nunique()
-            num_total = len(df[col])
-            if num_total > 0 and (num_unique / num_total) < 0.5:
-                df[col] = df[col].astype("category")
-
+        except Exception:
+            continue
+    if verbose:
+        end_mb = df.memory_usage(deep=True).sum() / 1e6
+        print(f"[DataCompressor] Память: {start_mb:.1f} MB -> {end_mb:.1f} MB")
     return df
 
 
-def locate_file(task_dir: Path, filename: str) -> Path:
-    """Умный поиск файлов датасета в каталоге задачи и подпапках."""
-    p = task_dir / filename
-    if p.exists():
-        return p
-    # Поиск в подпапках каталога задачи
-    for cand in task_dir.rglob(filename):
-        if cand.is_file():
-            return cand
-    # Поиск в общем репозитории на случай запуска из корня
-    for base in [Path.cwd(), Path(__file__).resolve().parent.parent]:
-        for cand in base.rglob(filename):
-            if cand.is_file() and cand.name == filename:
-                return cand
-    raise FileNotFoundError(f"Файл {filename} не найден в {task_dir} или его поддиректориях")
+def split_feature_types(X: pd.DataFrame) -> Tuple[List[str], List[str]]:
+    """Return (cat_features, num_features) using dtype + cardinality heuristics."""
+    cat_cols, num_cols = [], []
+    n = max(len(X), 1)
+    for col in X.columns:
+        dt = X[col].dtype
+        if pd.api.types.is_bool_dtype(dt) or pd.api.types.is_object_dtype(dt) \
+                or isinstance(dt, pd.CategoricalDtype) or pd.api.types.is_string_dtype(dt):
+            cat_cols.append(col)
+        elif pd.api.types.is_numeric_dtype(dt):
+            num_cols.append(col)
+        else:  # datetime & friends -> treated as categorical after stringification
+            try:
+                X[col] = X[col].astype(str)
+            except Exception:
+                pass
+            cat_cols.append(col)
+    return cat_cols, num_cols
 
 
-def load_and_preprocess_data(
-    task_dir: Path, profile: TaskProfile
-) -> Tuple[pd.DataFrame, pd.Series, pd.DataFrame, pd.Series, List[str], List[str]]:
-    """Загрузка, очистка и предварительная подготовка данных."""
-    task_dir = Path(task_dir)
-    train_path = locate_file(task_dir, "train.csv")
-    test_path = locate_file(task_dir, "test.csv")
-
-    print(f"[DataUtils] Чтение датасетов: train={train_path.name}, test={test_path.name}...")
-    train_df = pd.read_csv(train_path)
-    test_df = pd.read_csv(test_path)
-
-    id_col = profile.id_column
-    target_col = profile.target_column
-
-    # Проверка наличия колонок
-    if id_col not in test_df.columns:
-        test_df[id_col] = np.arange(len(test_df))
-    test_ids = test_df[id_col].copy()
-
-    if target_col not in train_df.columns:
-        raise ValueError(f"Целевая колонка '{target_col}' отсутствует в train.csv")
-
-    y_train = train_df[target_col].copy()
-
-    # Формируем признаки X
-    drop_train_cols = [col for col in [id_col, target_col] if col in train_df.columns]
-    drop_test_cols = [col for col in [id_col] if col in test_df.columns]
-
-    X_train = train_df.drop(columns=drop_train_cols)
-    X_test = test_df.drop(columns=drop_test_cols)
-
-    # Выравниваем колонки
-    common_cols = [c for c in X_train.columns if c in X_test.columns]
-    X_train = X_train[common_cols]
-    X_test = X_test[common_cols]
-
-    # Определяем типы признаков
-    cat_features = []
-    num_features = []
-
-    for col in common_cols:
-        is_num = pd.api.types.is_numeric_dtype(X_train[col])
-        if not is_num or X_train[col].dtype == object or str(X_train[col].dtype) == "category":
-            cat_features.append(col)
-        else:
-            num_features.append(col)
-
-    # Обработка категориальных колонок
-    for col in cat_features:
-        X_train[col] = X_train[col].astype(str).fillna("__MISSING__")
-        X_test[col] = X_test[col].astype(str).fillna("__MISSING__")
-
-    # Оптимизация численных колонок (downcasting)
-    X_train = optimize_dtypes(X_train)
-    X_test = optimize_dtypes(X_test)
-
-    print(f"[DataUtils] Данные готовы. Строк в train: {len(X_train)}, test: {len(X_test)}. Числовых фичей: {len(num_features)}, категориальных: {len(cat_features)}")
-    return X_train, y_train, X_test, test_ids, cat_features, num_features
+# --------------------------------------------------------------------------- #
+# Submission handling
+# --------------------------------------------------------------------------- #
+def make_submission_frame(test_ids: pd.Series, predictions, profile) -> pd.DataFrame:
+    """Build a submission DataFrame matching the expected column names."""
+    preds = np.asarray(predictions)
+    if preds.ndim > 1:
+        preds = preds.ravel()
+    target_name = getattr(profile, "target_column", "target") or "target"
+    id_name = getattr(profile, "id_column", "id") or "id"
+    df = pd.DataFrame({id_name: np.asarray(test_ids), target_name: preds})
+    return df
 
 
-def save_atomic_submission(
-    task_dir: Path,
-    test_ids: pd.Series,
-    predictions: np.ndarray,
-    profile: TaskProfile,
-) -> Path:
-    """Атомарная запись submission.csv с проверкой целостности данных."""
-    task_dir = Path(task_dir)
-    target_path = task_dir / "submission.csv"
-    temp_path = task_dir / ".submission_tmp.csv"
+def _align_with_sample(df: pd.DataFrame, sample: Optional[pd.DataFrame]) -> pd.DataFrame:
+    """Match column names/dtypes and row order with sample_submission when possible."""
+    if sample is None or sample.shape[1] != 2 or df.shape[1] != 2:
+        return df
+    df = df.copy()
+    df.columns = list(sample.columns)
+    sample_id_col, sample_tgt_col = sample.columns[0], sample.columns[1]
+    # row order: align on id if the sample ids are a permutation of ours
+    try:
+        if len(sample) == len(df):
+            sample_ids = sample[sample_id_col]
+            our_ids = df[sample_id_col]
+            if not np.array_equal(np.asarray(sample_ids), np.asarray(our_ids)):
+                tmp = df.set_index(sample_id_col, drop=False)
+                if tmp.index.is_unique and sample_ids.isin(tmp.index).all():
+                    df = tmp.loc[np.asarray(sample_ids)].reset_index(drop=True)
+                    df.columns = list(sample.columns)
+    except Exception:
+        pass
+    # id dtype: keep sample dtype when it round-trips
+    try:
+        target_dt = sample_id_col and sample[sample_id_col].dtype
+        if pd.api.types.is_numeric_dtype(target_dt):
+            df[sample_id_col] = pd.to_numeric(df[sample_id_col], errors="coerce").fillna(-1)
+            df[sample_id_col] = df[sample_id_col].astype(target_dt)
+    except Exception:
+        pass
+    return df
 
-    # Формируем DataFrame сабмита
-    sub_df = pd.DataFrame({
-        profile.id_column: test_ids,
-        profile.target_column: predictions,
-    })
 
-    # Синхронизация структуры с sample_submission.csv (названия колонок и типы)
-    sample_sub_path = task_dir / "sample_submission.csv"
-    if sample_sub_path.exists():
+def _sanitize_predictions(df: pd.DataFrame, profile) -> pd.DataFrame:
+    """Guarantee finite values and correct dtypes in the prediction column."""
+    tgt = df.columns[-1]
+    task_type = getattr(profile, "task_type", "regression")
+    if task_type == "regression":
+        vals = pd.to_numeric(df[tgt], errors="coerce")
+        arr = np.asarray(vals, dtype=float)
+        finite = np.isfinite(arr)
+        if not finite.all():
+            fill = float(np.nanmedian(arr[finite])) if finite.any() else 0.0
+            arr = np.where(finite, arr, fill)
+        df[tgt] = arr.astype(np.float64)
+    else:
+        if getattr(profile, "predict_proba", False):
+            # probability submissions (e.g. ROC-AUC metrics): keep numeric scores
+            vals = pd.to_numeric(df[tgt], errors="coerce")
+            arr = np.asarray(vals, dtype=float)
+            finite = np.isfinite(arr)
+            if not finite.all():
+                fill = float(np.nanmedian(arr[finite])) if finite.any() else 0.0
+                arr = np.where(finite, arr, fill)
+            df[tgt] = arr
+            return df
+        vals = df[tgt].astype(str)
+        labels = getattr(profile, "class_labels", None)
+        if labels:
+            bad = ~vals.isin([str(v) for v in labels])
+            if bad.any():
+                vals = vals.where(~bad, str(labels[0]))
+        df[tgt] = vals
+    return df
+
+
+def save_submission(task_dir: Path, test_ids: pd.Series, predictions, profile) -> Optional[Path]:
+    """Atomic submission writer.  Always leaves a readable `submission.csv` behind."""
+    task_dir = Path(task_dir).resolve()
+    df = make_submission_frame(test_ids, predictions, profile)
+    sample = None
+    try:
+        sample_path = locate_file(task_dir, "sample_submission.csv", required=False)
+        if sample_path is not None:
+            sample = read_csv_safe(sample_path, nrows=max(len(df) + 10, 10))
+    except Exception:
+        sample = None
+    df = _align_with_sample(df, sample)
+    df = _sanitize_predictions(df, profile)
+
+    targets = [task_dir]
+    try:
+        cwd = Path.cwd().resolve()
+        if cwd != task_dir:
+            targets.append(cwd)
+    except Exception:
+        pass
+    written = None
+    for out_dir in targets:
         try:
-            sample_df = pd.read_csv(sample_sub_path, nrows=5)
-            if len(sample_df.columns) == 2:
-                sub_df.columns = list(sample_df.columns)
-            sub_df[sub_df.columns[0]] = sub_df[sub_df.columns[0]].astype(sample_df[sample_df.columns[0]].dtype)
+            tmp = out_dir / f".submission_tmp_{os.getpid()}_{int(np.random.randint(1e9))}.csv"
+            df.to_csv(tmp, index=False, encoding="utf-8")
+            final = out_dir / "submission.csv"
+            os.replace(tmp, final)
+            written = final if written is None else written
         except Exception:
-            pass
+            try:
+                final = out_dir / "submission.csv"
+                df.to_csv(final, index=False, encoding="utf-8")
+                written = final if written is None else written
+            except Exception:
+                pass
+    return written
 
-    # Проверка на пропуски или бесконечности
-    target_c = sub_df.columns[1]
-    if sub_df[target_c].isnull().any():
-        print("[DataUtils] ВНИМАНИЕ: Обнаружены NaN в предсказаниях! Заполняем дефолтным значением.")
-        if profile.task_type == "regression":
-            sub_df[target_c] = sub_df[target_c].fillna(0.0)
-        else:
-            sub_df[target_c] = sub_df[target_c].fillna(sub_df[target_c].mode()[0])
 
-    # Запись во временный файл и атомарный rename
-    sub_df.to_csv(temp_path, index=False, encoding="utf-8")
-    os.replace(temp_path, target_path)
-
-    print(f"[DataUtils] Успешно записан и верифицирован: {target_path.name} ({len(sub_df)} строк)")
-    return target_path
+def validate_submission(task_dir: Path, profile, n_expected: Optional[int] = None) -> Tuple[bool, str]:
+    """Final gate: check the written submission against the sample submission."""
+    task_dir = Path(task_dir).resolve()
+    sub_path = task_dir / "submission.csv"
+    if not sub_path.is_file() or sub_path.stat().st_size == 0:
+        return False, "submission.csv отсутствует или пуст"
+    try:
+        sub = read_csv_safe(sub_path)
+    except Exception as e:  # noqa: BLE001
+        return False, f"submission.csv не читается: {e}"
+    sample_path = locate_file(task_dir, "sample_submission.csv", required=False)
+    if sample_path is not None:
+        try:
+            sample = read_csv_safe(sample_path)
+            if list(sub.columns) != list(sample.columns):
+                return False, f"колонки {list(sub.columns)} != {list(sample.columns)}"
+            if len(sub) != len(sample):
+                return False, f"строк {len(sub)} != {len(sample)}"
+            id_col = sample.columns[0]
+            if not np.array_equal(np.asarray(sub[id_col]), np.asarray(sample[id_col])):
+                return False, "порядок/значения id не совпадают с sample_submission"
+        except Exception as e:  # noqa: BLE001
+            return False, f"сверка с sample_submission не удалась: {e}"
+    if n_expected is not None and len(sub) != n_expected:
+        return False, f"строк {len(sub)} != ожидаемых {n_expected}"
+    tgt = sub.columns[-1]
+    if sub[tgt].isnull().any():
+        return False, f"в колонке {tgt} есть пропуски"
+    if getattr(profile, "task_type", "regression") == "regression":
+        vals = pd.to_numeric(sub[tgt], errors="coerce")
+        if vals.isnull().any() or not np.isfinite(np.asarray(vals, float)).all():
+            return False, "регрессионные предсказания содержат NaN/inf"
+    return True, f"OK: {len(sub)} строк, колонки {list(sub.columns)}"

@@ -1,136 +1,170 @@
-from typing import Any, Dict, List, Literal, Optional, Union
-from pydantic import BaseModel, Field, model_validator
+"""Typed experiment passport (`TaskProfile`) and LLM prompt templates."""
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Optional
 
 
-# =============================================================================
-# 1. СХЕМА АГЕНТА 1: TaskProfiler (Паспорт эксперимента по PIPELINE.md §1.1)
-# =============================================================================
+@dataclass
+class TaskProfile:
+    """Structured experiment passport (see PROMPT.md §4.2)."""
 
-class TaskProfile(BaseModel):
-    """Структурированный паспорт эксперимента и задачи машинного обучения."""
-    task_type: Literal["regression", "binary_classification", "multiclass_classification"] = Field(
-        description="Тип ML-задачи: regression, binary_classification или multiclass_classification"
-    )
-    target_column: str = Field(
-        description="Название целевой колонки (target) в обучающей выборке"
-    )
-    id_column: str = Field(
-        default="id",
-        description="Название колонки с идентификатором строки"
-    )
-    metric: str = Field(
-        description="Основная целевая метрика оптимизации (RMSE, Macro F1, ROC-AUC, Accuracy)"
-    )
-    objective: Literal["minimize", "maximize"] = Field(
-        default="minimize",
-        description="Направление оптимизации: minimize (RMSE/MAE) или maximize (Macro F1/ROC-AUC)"
-    )
-    modality: str = Field(
-        default="tabular",
-        description="Модальность входных данных (tabular)"
-    )
-    time_column: Optional[str] = Field(
-        default=None,
-        description="Название колонки с временной меткой или датой (если применимо)"
-    )
-    description_summary: Optional[str] = Field(
-        default="",
-        description="Краткая формулировка физического/бизнес-смысла задачи"
-    )
+    task_type: str = "regression"                 # regression | binary | multiclass | multilabel
+    target_column: str = "target"
+    id_column: str = "id"
+    metric: str = "RMSE"
+    objective: str = "minimize"                   # minimize | maximize
+    description_summary: str = ""
+    # structure of the dataset
+    time_column: Optional[str] = None
+    time_periods: List[Any] = field(default_factory=list)
+    test_periods: List[Any] = field(default_factory=list)
+    temporal_extrapolation: bool = False
+    entity_columns: List[str] = field(default_factory=list)
+    entity_score: float = 0.0
+    entity_coverage: float = 0.0
+    # classification details
+    class_labels: List[str] = field(default_factory=list)
+    n_classes: int = 0
+    predict_proba: bool = False                   # submit probabilities instead of labels
+    target_columns: List[str] = field(default_factory=list)   # multilabel case
+    # numeric target range for physical clipping
+    target_min: Optional[float] = None
+    target_max: Optional[float] = None
+    target_transform: str = "none"                # none | log1p
+    # bookkeeping
+    n_train: int = 0
+    n_test: int = 0
+    notes: Dict[str, Any] = field(default_factory=dict)
+
+    # ------------------------------------------------------------------ #
+    @property
+    def is_classification(self) -> bool:
+        return self.task_type in ("binary", "multiclass", "multilabel")
+
+    @property
+    def is_regression(self) -> bool:
+        return self.task_type == "regression"
+
+    def pretty(self) -> str:
+        lines = [
+            f"тип задачи        : {self.task_type}",
+            f"целевой признак   : {self.target_column}",
+            f"id колонка        : {self.id_column}",
+            f"метрика           : {self.metric} ({self.objective})",
+            f"временная колонка : {self.time_column or '—'}",
+            f"периоды train     : {self.time_periods[:8]}",
+            f"периоды test      : {self.test_periods[:8]}",
+            f"сущность (entity) : {self.entity_columns or '—'} (score={self.entity_score:.3f}, "
+            f"coverage={self.entity_coverage:.2f})",
+        ]
+        if self.is_classification:
+            lines.append(f"классов           : {self.n_classes}")
+        return "\n".join(f"      • {l}" for l in lines)
+
+    def router_report(self) -> Dict[str, Any]:
+        """Structured router passport (spec §5.2): task type, metric, model portfolio."""
+        families = []
+        if self.is_regression:
+            families = [
+                {"name": "catboost", "suitability_score": 0.95,
+                 "rationale": "oblivious boosting — силён на смешанных табличных данных"},
+                {"name": "lightgbm", "suitability_score": 0.92,
+                 "rationale": "листовой бустинг, быстрый на широких таблицах"},
+                {"name": "xgboost", "suitability_score": 0.88,
+                 "rationale": "регуляризованный бустинг для разнообразия ансамбля"},
+                {"name": "hist_gb", "suitability_score": 0.85,
+                 "rationale": "гистограммный бустинг sklearn как независимая реализация"},
+                {"name": "extra_trees", "suitability_score": 0.75,
+                 "rationale": "рандомизированный бэггинг снижает дисперсию"},
+                {"name": "ridge", "suitability_score": 0.65,
+                 "rationale": "линейная регуляризованная база для блендинга"},
+            ]
+        elif self.is_classification:
+            families = [
+                {"name": "lightgbm", "suitability_score": 0.93,
+                 "rationale": "мультиклассовый бустинг с нативной поддержкой категорий"},
+                {"name": "catboost", "suitability_score": 0.91,
+                 "rationale": "устойчив к дисбалансу классов, oblivious-деревья"},
+                {"name": "xgboost", "suitability_score": 0.87,
+                 "rationale": "softprob-бустинг с регуляризацией"},
+                {"name": "hist_gb", "suitability_score": 0.84,
+                 "rationale": "быстрый гистограммный бустинг"},
+                {"name": "logreg", "suitability_score": 0.66,
+                 "rationale": "линейная модель для калибровки вероятностей"},
+            ]
+        return {
+            "task_type": self.task_type,
+            "target": self.target_column,
+            "input_modality": ["tabular"] + (["time_series"] if self.time_column else []),
+            "supervision": "supervised",
+            "model_families": families,
+            "constraints": {"latency_sensitive": False, "max_training_time_sec": 9000,
+                            "memory_limit_mb": 32768},
+            "recommended_metric": self.metric,
+            "ambiguity_level": "low" if self.metric else "medium",
+            "detected_metric": self.metric,
+            "temporal_extrapolation": bool(self.temporal_extrapolation),
+            "entity_key_candidates": self.entity_columns,
+            "n_train": self.n_train,
+            "n_test": self.n_test,
+        }
 
 
-PROFILER_SYSTEM_PROMPT = """Ты — ведущий эксперт по машинному обучению и Data Science (Agent 1: TaskProfiler).
-Твоя задача — внимательно изучить условие ML-задачи (task.md) и структуру колонок датасета, после чего точно определить:
-1. task_type: "regression", "binary_classification" или "multiclass_classification".
-2. target_column: точное имя колонки, которую нужно предсказать.
-3. id_column: колонка с идентификатором строки (обычно "id").
-4. metric: целевая метрика (например, "RMSE" или "Macro F1").
-5. objective: "minimize" (для ошибок вроде RMSE/MSE) или "maximize" (для F1, точности, ROC-AUC).
-
-Ответь СТРОГО валидным JSON-объектом в формате схемы TaskProfile без лишних рассуждений и текста.
-"""
-
-
-# =============================================================================
-# 2. СХЕМЫ АГЕНТА 2: FeatureArchitect (Инженер признаков по PIPELINE.md §2.4)
-# =============================================================================
-
-class FeatureHypothesis(BaseModel):
-    """Гипотеза создания отдельного признака или группы признаков."""
-    feature_name: Optional[str] = Field(default="feat", description="Имя нового признака")
-    rationale: Optional[str] = Field(default="", description="Физический/доменный смысл признака")
-    formula_expression: Optional[str] = Field(default="", description="Формула признака")
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_fields(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            name = data.get("feature_name") or data.get("name") or "feat"
-            rationale = data.get("rationale") or data.get("description") or ""
-            formula = data.get("formula_expression") or data.get("formula") or ""
-            return {"feature_name": str(name), "rationale": str(rationale), "formula_expression": str(formula)}
-        return data
-
-
-class FeatureProposal(BaseModel):
-    """Пакет гипотез и исполняемый Python-код для генерации признаков с поддержкой алиасов."""
-    hypotheses: List[FeatureHypothesis] = Field(default_factory=list)
-    python_code: str = Field(default="")
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_input(cls, data: Any) -> Any:
-        if isinstance(data, dict):
-            # Поддержка альтернативных ключей от LLM
-            hyps = data.get("hypotheses") or data.get("features") or data.get("hypotheses_list") or []
-            code = data.get("python_code") or data.get("code") or data.get("function_code") or ""
-            return {"hypotheses": hyps, "python_code": str(code)}
-        return data
-
-
-FEATURE_ARCHITECT_SYSTEM_PROMPT = """Ты — ведущий Feature Engineer в команде (Agent 2: FeatureArchitect).
-Твоя цель — проанализировать постановку задачи и предложить от 3 до 5 мощных доменных признаков.
-ВАЖНО: Рассуждай предельно кратко (не более 2-3 предложений). Сразу переходи к выводу JSON-объекта!
-
-ПРАВИЛА СОЗДАНИЯ ПРИЗНАКОВ (по PIPELINE.md §2.4):
-1. Используй только детерминированные воспроизводимые преобразования:
-   - Отношения величин (ОБЯЗАТЕЛЬНО с защитой от деления на ноль: `+ 1` или `+ 1e-5`).
-   - Разности взаимосвязанных величин (например, max - min, start - end).
-   - Скорости и интенсивности (величина / (duration + 0.001)).
-   - Логарифмирование неотрицательных величин `np.log1p(df[col].clip(lower=0))`.
-   - Взаимодействия (произведения связанных факторов).
-2. СТРОГИЙ ЗАПРЕТ НА УТЕЧКИ (DATA LEAKAGE):
-   - Запрещено использовать или упоминать целевую колонку (target)!
-   - Запрещено использовать внешние данные или статистику из test в train.
-3. КОД ДОЛЖЕН БЫТЬ ОФОРМЛЕН КАК ФУНКЦИЯ:
-   def add_features(df: pd.DataFrame) -> pd.DataFrame:
-       df = df.copy()
-       # создание новых колонок
-       return df
-
-Формат вывода JSON:
+# --------------------------------------------------------------------------- #
+# LLM prompts (used sparingly: the platform LLM is a slow reasoning model)
+# --------------------------------------------------------------------------- #
+PROFILER_SYSTEM_PROMPT = """Ты — агент-роутер AutoML. По описанию задачи и словарю признаков верни СТРОГО JSON:
 {
-  "hypotheses": [
-    {"feature_name": "ratio_1", "rationale": "смысл", "formula_expression": "col1 / col2"}
-  ],
-  "python_code": "def add_features(df:\\n    df = df.copy()\\n    ...\\n    return df"
+  "task_type": "regression|binary|multiclass",
+  "target": "имя целевой колонки",
+  "metric": "RMSE|MAE|R2|Macro F1|ROC-AUC|Accuracy|LogLoss",
+  "objective": "minimize|maximize",
+  "time_column": "имя колонки периода или null",
+  "entity_columns": ["колонки, идентифицирующие один и тот же объект между строками"],
+  "submission_kind": "labels|probabilities",
+  "ambiguity": "low|medium|high",
+  "rationale": "одно предложение"
 }
+Только JSON, без markdown."""
+
+FEATURE_SYSTEM_PROMPT = """Ты — инженер признаков. По описанию задачи и списку колонок предложи ОДНУ
+содержательную формулу новых признаков. Верни СТРОГО JSON:
+{
+  "hypothesis": "краткое название гипотезы",
+  "rationale": "зачем это должно помочь",
+  "python_code": "def add_features(df):\\n    ...\\n    return df"
+}
+Требования к коду:
+- функция `add_features(df)` принимает pandas DataFrame и возвращает DataFrame с теми же строками;
+- можно использовать numpy (np) и pandas (pd), они уже импортированы;
+- НЕЛЬЗЯ: читать файлы, сеть, subprocess, print, изменения исходных колонок;
+- добавляй не более 4 новых колонок, защищайся от деления на ноль (+1e-5) и логирования отрицательных (np.log1p(x.clip(lower=0)));
+- код должен быть детерминированным и работать без исключений.
+Только JSON, без markdown."""
+
+CRITIC_SYSTEM_PROMPT = """Ты — критик ML-экспериментов. По истории экспериментов реши: продолжать поиск
+признаков или остановиться. Верни СТРОГО JSON:
+{"decision": "continue|stop", "what_worked": "...", "next_direction": "..."}"""
+
+
+def profiler_user_prompt(task_text: str, dictionary_text: str, data_overview: str) -> str:
+    return f"""=== ОПИСАНИЕ ЗАДАЧИ ===
+{task_text[:3500]}
+
+=== СЛОВАРЬ ПРИЗНАКОВ (фрагмент) ===
+{dictionary_text[:1500]}
+
+=== СХЕМА ДАННЫХ ===
+{data_overview[:1500]}
 """
 
 
-# =============================================================================
-# 3. СХЕМЫ АГЕНТА 4: CriticMonitor (Монитор качества по PIPELINE.md §8)
-# =============================================================================
+def feature_user_prompt(task_text: str, columns_text: str, hypothesis_history: str) -> str:
+    return f"""=== ОПИСАНИЕ ЗАДАЧИ ===
+{task_text[:2200]}
 
-class CriticVerdict(BaseModel):
-    """Вердикт качества эксперимента на основе 5-Fold кросс-валидации."""
-    status: Literal["PASS", "FAIL", "UNCERTAIN"] = Field(
-        description="PASS — метрика улучшилась, FAIL — деградация или переобучение, UNCERTAIN — шум"
-    )
-    current_cv_score: float = Field(description="Валидационный скор текущей итерации")
-    previous_best_score: float = Field(description="Лучший исторический валидационный скор")
-    delta: float = Field(description="Изменение метрики относительно предыдущего лучшего")
-    is_improvement: bool = Field(description="Флаг: является ли текущий результат новым рекордом")
-    critique_for_agents: str = Field(
-        description="Замечания и рекомендации для следующей итерации (почему фичи сработали или нет)"
-    )
+=== ДОСТУПНЫЕ КОЛОНКИ ===
+{columns_text[:2500]}
+
+=== УЖЕ ИСПРОБОВАННЫЕ ГИПОТЕЗЫ ===
+{hypothesis_history[:1500]}
+"""

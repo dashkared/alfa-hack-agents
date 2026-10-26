@@ -43,6 +43,7 @@ catboost_info/
 AutogluonModels/
 autogluon_output/
 # Логи и эксперименты:
+work/
 mlruns/
 wandb/
 lightning_logs/

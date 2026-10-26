@@ -85,31 +85,25 @@ def train_gradient_boosting_cv(
             if backend == "catboost":
                 from catboost import CatBoostRegressor
                 model = CatBoostRegressor(
-                    iterations=700,
-                    learning_rate=0.06,
+                    iterations=600,
+                    learning_rate=0.08,
                     depth=6,
                     thread_count=8,
                     random_seed=42 + fold,
                     verbose=0,
                 )
-                model.fit(X_tr.fillna(-999), y_tr, eval_set=(X_va.fillna(-999), y_va), early_stopping_rounds=50, verbose=False)
-                val_preds = model.predict(X_va.fillna(-999))
-                oof_preds[val_idx] = val_preds
-                test_preds += model.predict(X_test_enc.fillna(-999)) / n_splits
+                model.fit(X_tr, y_tr, eval_set=(X_va, y_va), early_stopping_rounds=50, verbose=False)
             elif backend == "lightgbm":
                 from lightgbm import LGBMRegressor
                 model = LGBMRegressor(
-                    n_estimators=700,
-                    learning_rate=0.05,
-                    num_leaves=45,
+                    n_estimators=600,
+                    learning_rate=0.08,
+                    max_depth=6,
                     n_jobs=8,
                     random_state=42 + fold,
                     verbose=-1,
                 )
                 model.fit(X_tr, y_tr, eval_set=[(X_va, y_va)])
-                val_preds = model.predict(X_va)
-                oof_preds[val_idx] = val_preds
-                test_preds += model.predict(X_test_enc) / n_splits
             else:
                 from sklearn.ensemble import HistGradientBoostingRegressor
                 model = HistGradientBoostingRegressor(
@@ -119,9 +113,10 @@ def train_gradient_boosting_cv(
                     random_state=42 + fold,
                 )
                 model.fit(X_tr, y_tr)
-                val_preds = model.predict(X_va)
-                oof_preds[val_idx] = val_preds
-                test_preds += model.predict(X_test_enc) / n_splits
+
+            val_preds = model.predict(X_va)
+            oof_preds[val_idx] = val_preds
+            test_preds += model.predict(X_test_enc) / n_splits
 
         # Расчет RMSE
         oof_score = float(np.sqrt(mean_squared_error(y_vals, oof_preds)))

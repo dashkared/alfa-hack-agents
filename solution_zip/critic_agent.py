@@ -1,146 +1,86 @@
-from pathlib import Path
-from typing import List, Optional, Tuple
+"""Agent 4 — CriticMonitorAgent.
+
+Turns noisy validation numbers into accept/reject decisions:
+  * a new configuration is accepted only if it is better *and* (when the folds are
+    comparable) the improvement is consistent across folds — this protects against
+    single-fold noise and against "metric hacking" on an optimistic split;
+  * keeps the experiment ledger, the incumbent configuration and the stopping rule.
+"""
+from typing import Any, Dict, List, Optional
 
 import numpy as np
-import pandas as pd
-from data_utils import save_atomic_submission
-from prompts import CriticVerdict, TaskProfile
+
+from evaluation import metric_direction, relative_gain
 
 
 class CriticMonitorAgent:
-    """Агент 4: Монитор качества и Судья (по PIPELINE.md §8).
-    Оценивает результаты, ставит вердикты PASS/FAIL и управляет критерием останова.
-    Включает парный статистический контроль по фолдам кросс-валидации.
-    """
-
-    def __init__(self, task_dir: Path, profile: TaskProfile, patience: int = 2):
-        self.task_dir = Path(task_dir)
-        self.profile = profile
-        self.best_score: Optional[float] = None
-        self.best_iteration: int = -1
-        self.best_fold_scores: Optional[List[float]] = None
+    def __init__(self, metric: str, objective: Optional[str] = None, patience: int = 2,
+                 verbose: bool = True):
+        self.metric = metric
+        self.direction = "maximize" if str(objective or metric_direction(metric)).lower().startswith("max") \
+            else "minimize"
         self.patience = patience
-        self.consecutive_fails: int = 0
-        self.history = []
+        self.verbose = verbose
+        self.history: List[Dict[str, Any]] = []
+        self.best: Optional[Dict[str, Any]] = None
+        self.best_score: Optional[float] = None
+        self._no_improvement = 0
 
-    def should_stop(self) -> Tuple[bool, str]:
-        """Критерий останова: проверка на стагнацию (patience)."""
-        if self.consecutive_fails >= self.patience:
-            return True, f"Сработал критерий останова: {self.consecutive_fails} неудачных гипотез подряд без улучшения (Stagnation Early Stopping)."
-        return False, ""
+    # ------------------------------------------------------------------ #
+    def _better(self, a: Optional[float], b: Optional[float]) -> bool:
+        if a is None or not np.isfinite(a):
+            return False
+        if b is None or not np.isfinite(b):
+            return True
+        return (a > b) if self.direction == "maximize" else (a < b)
 
-    def evaluate_experiment(
-        self,
-        iteration: int,
-        hypothesis_name: str,
-        current_cv_score: float,
-        test_predictions: np.ndarray,
-        test_ids: pd.Series,
-        fold_scores: Optional[List[float]] = None,
-    ) -> CriticVerdict:
-        """Оценка итогов эксперимента, вынесение вердикта и чекпоинт лучшего сабмита.
-        Использует парный статистический контроль по фолдам кросс-валидации (PIPELINE.md §8).
-        """
-        is_minimize = (self.profile.objective == "minimize")
-
-        # ---------------------------------------------------------------------
-        # Итерация 0: Фиксация начальной точки отсчета
-        # ---------------------------------------------------------------------
-        if self.best_score is None:
-            self.best_score = current_cv_score
-            self.best_iteration = iteration
-            self.best_fold_scores = fold_scores.copy() if fold_scores else None
-            self.consecutive_fails = 0
-            save_atomic_submission(self.task_dir, test_ids, test_predictions, self.profile)
-
-            verdict = CriticVerdict(
-                status="PASS",
-                current_cv_score=current_cv_score,
-                previous_best_score=current_cv_score,
-                delta=0.0,
-                is_improvement=True,
-                critique_for_agents="Базовый бейзлайн зафиксирован как точка отсчета. Начинаем итеративное улучшение.",
-            )
-            self.history.append((iteration, hypothesis_name, current_cv_score, "PASS", 0.0))
-            return verdict
-
-        # ---------------------------------------------------------------------
-        # Оценка направления улучшения метрики
-        # ---------------------------------------------------------------------
-        if is_minimize:
-            delta = self.best_score - current_cv_score
-            is_better = current_cv_score < self.best_score
+    def evaluate(self, name: str, score: float, fold_scores: Optional[List[float]] = None,
+                 accept_margin: float = 0.0) -> Dict[str, Any]:
+        """Compare an experiment against the incumbent and update the ledger."""
+        prev = self.best
+        gain_rel = relative_gain(score, self.best_score, self.direction) \
+            if self.best_score is not None else 1.0
+        better = self._better(score, self.best_score)
+        consistent, paired_gain = True, 0.0
+        if prev is not None and prev.get("fold_scores") and fold_scores \
+                and len(prev["fold_scores"]) == len(fold_scores):
+            try:
+                old = np.asarray(prev["fold_scores"], dtype=float)
+                new = np.asarray(fold_scores, dtype=float)
+                diff = (new - old) if self.direction == "maximize" else (old - new)
+                paired_gain = float(np.mean(diff))
+                consistent = bool(np.sum(diff > 0) >= max(1, int(np.ceil(len(diff) / 2))))
+            except Exception:
+                consistent, paired_gain = True, 0.0
+        accepted = bool(better and (gain_rel >= accept_margin))
+        if accepted and prev is not None and prev.get("fold_scores") and fold_scores \
+                and len(prev["fold_scores"]) == len(fold_scores) and not consistent and paired_gain <= 0:
+            accepted = False
+        verdict = {"name": name, "score": float(score), "fold_scores": fold_scores,
+                   "accepted": accepted, "consistent": consistent, "gain_rel": float(gain_rel),
+                   "paired_gain": paired_gain, "previous_best": self.best_score}
+        self.history.append(verdict)
+        if accepted or self.best is None:
+            self.best = verdict
+            self.best_score = float(score)
+            self._no_improvement = 0
         else:
-            delta = current_cv_score - self.best_score
-            is_better = current_cv_score > self.best_score
-
-        # ---------------------------------------------------------------------
-        # Парный статистический контроль по фолдам (по PIPELINE.md §8)
-        # ---------------------------------------------------------------------
-        fold_support_ratio = 1.0
-        fold_msg = ""
-        if fold_scores is not None and self.best_fold_scores is not None and len(fold_scores) == len(self.best_fold_scores):
-            fold_deltas = [
-                (bf - cf) if is_minimize else (cf - bf)
-                for cf, bf in zip(fold_scores, self.best_fold_scores)
-            ]
-            improved_folds = sum(1 for d in fold_deltas if d > 0)
-            total_folds = len(fold_deltas)
-            fold_support_ratio = improved_folds / total_folds
-            fold_msg = f" (улучшение на {improved_folds}/{total_folds} фолдах)"
-
-        # ---------------------------------------------------------------------
-        # Логика вердикта по PIPELINE.md §8
-        # ---------------------------------------------------------------------
-        if is_better and delta > 0.0:
-            # Защита от оверфита на случайный одиночный фолд:
-            # Если общий скор формально вырос, но улучшился строго 1 фолд из 5 (а на 4 фолдах деградация),
-            # классифицируем как UNCERTAIN для предотвращения зашумления сабмита.
-            if fold_support_ratio < 0.35 and len(fold_scores or []) >= 4:
-                status = "UNCERTAIN"
-                self.consecutive_fails += 1
-                critique = (
-                    f"Дельта положительна ({delta:+.4f}), но вызвана случайным выбросом одного фолда{fold_msg}. "
-                    "Откат для защиты от переобучения на валидацию."
-                )
-            else:
-                status = "PASS"
-                self.consecutive_fails = 0
-                self.best_score = current_cv_score
-                self.best_iteration = iteration
-                if fold_scores:
-                    self.best_fold_scores = fold_scores.copy()
-
-                # Чекпоинт: сохраняем улучшенный сабмит
-                save_atomic_submission(self.task_dir, test_ids, test_predictions, self.profile)
-                critique = (
-                    f"Отличная гипотеза! Метрика улучшилась на {abs(delta):.4f}{fold_msg}. "
-                    "Эти признаки приняты в основу. Развивай это направление дальше."
-                )
-        elif abs(delta) < 0.0005:
-            # Дельта около нуля без статистического улучшения
-            status = "UNCERTAIN"
-            self.consecutive_fails += 1
-            critique = (
-                f"Изменение в пределах шума (дельта {delta:+.5f}){fold_msg}. "
-                "Гипотеза не дает статистического преимущества. Попробуй более контрастные признаки."
-            )
-        else:
-            status = "FAIL"
-            self.consecutive_fails += 1
-            critique = (
-                f"Метрика ухудшилась на {abs(delta):.4f}{fold_msg} (признаки вызвали переобучение или зашумление). "
-                "ОТКАТ к предыдущему стабильному состоянию. Смени подход: попробуй нелинейные соотношения или агрегаты."
-            )
-
-        verdict = CriticVerdict(
-            status=status,
-            current_cv_score=current_cv_score,
-            previous_best_score=self.best_score,
-            delta=float(delta),
-            is_improvement=is_better,
-            critique_for_agents=critique,
-        )
-
-        self.history.append((iteration, hypothesis_name, current_cv_score, status, float(delta)))
+            self._no_improvement += 1
+        if self.verbose:
+            mark = "✅ принято" if accepted else "⛔ отклонено"
+            ref = self.best_score if accepted else (prev["score"] if prev else None)
+            ref_txt = "—" if ref is None else f"{ref:.4f}"
+            print(f"   [Critic] {name}: {self.metric}={score:.4f} (best={ref_txt}) → {mark}", flush=True)
         return verdict
+
+    def should_stop(self) -> bool:
+        return self._no_improvement >= self.patience
+
+    def summary(self) -> str:
+        if self.best is None:
+            return "[Critic] экспериментов не было"
+        return (f"[Critic] лучшая конфигурация: {self.best['name']} "
+                f"({self.metric}={self.best_score:.4f}); экспериментов: {len(self.history)}")
+
+    def ledger(self) -> List[Dict[str, Any]]:
+        return self.history
